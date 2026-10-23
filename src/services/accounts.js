@@ -14,6 +14,17 @@
  *   listSaves()            -> {difficulty: save}
  *   writeSave(save)
  *   currentUser()
+ *
+ * Two separate facts drive this module:
+ *
+ *   cloudAvailable — the backend is configured and reachable. The server
+ *                    answers 401 when nobody is signed in, and 503 when it is
+ *                    not configured at all. Those are different answers and
+ *                    the difference decides whether accounts are local or
+ *                    cloud.
+ *   sessionToken   — this device is signed in to a cloud account. It is kept
+ *                    in localStorage so a reload stays signed in and the
+ *                    campaign really does follow you across devices.
  */
 
 import { LS_ACCOUNTS } from '../core/constants.js';
@@ -21,6 +32,13 @@ import { state } from '../state/store.js';
 
 /** Remembers which local account was last signed in, so a reload keeps you in. */
 const LS_SESSION = 'ev_session';
+
+/** The cloud session token, so a reload stays signed in to the cloud. */
+const LS_CLOUD_TOKEN = 'ev_cloud_token';
+
+/** The API lives at the site root. Absolute paths, so a page in a subfolder
+ *  (the probe lives in /tools/) still finds it. */
+const API = '/api';
 
 /** Session token for the cloud backend, if signed in to one. */
 let sessionToken = null;
@@ -52,6 +70,31 @@ function writeLocal(accounts) {
 }
 
 /**
+ * Read the stored cloud session token.
+ * @returns {string|null}
+ */
+function readToken() {
+  try {
+    return localStorage.getItem(LS_CLOUD_TOKEN) || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Remember the cloud session token on this device.
+ * @param {string|null} token
+ */
+function writeToken(token) {
+  try {
+    if (token) localStorage.setItem(LS_CLOUD_TOKEN, token);
+    else localStorage.removeItem(LS_CLOUD_TOKEN);
+  } catch {
+    /* storage blocked */
+  }
+}
+
+/**
  * Hash a password for local storage. This is only a speed bump for a
  * single-player local profile — the cloud backend hashes server-side with a
  * proper KDF.
@@ -77,56 +120,88 @@ async function localHash(user, pass) {
 }
 
 /**
- * Probe whether the cloud backend is configured and reachable.
- * @returns {Promise<boolean>}
- */
-export async function detectCloud() {
-  try {
-    const res = await fetch('api/session', { method: 'GET', headers: authHeaders() });
-    cloudAvailable = res.ok;
-    if (res.ok) {
-      const data = await res.json().catch(() => ({}));
-      if (data.user) state.meta.user = data.user;
-    }
-  } catch {
-    cloudAvailable = false;
-  }
-  return cloudAvailable;
-}
-
-/**
- * @returns {boolean} true when the cloud backend is in use
- */
-export const usingCloud = () => cloudAvailable && !!sessionToken;
-
-/**
  * Build request headers.
+ * @param {string|null} [token] token to send, defaults to the current one
  * @returns {Object}
  */
-function authHeaders() {
+function authHeaders(token) {
   const h = { 'Content-Type': 'application/json' };
-  if (sessionToken) h.Authorization = 'Bearer ' + sessionToken;
+  const t = token === undefined ? sessionToken : token;
+  if (t) h.Authorization = 'Bearer ' + t;
   return h;
 }
 
 /**
- * Restore the previous local session, if there was one.
+ * Probe whether the cloud backend is configured and reachable.
+ *
+ * The server distinguishes "not configured" (503) from "not signed in" (401),
+ * and so must this: treating 401 as "no cloud" is what used to make the
+ * backend permanently unreachable.
+ * @returns {Promise<boolean>}
+ */
+export async function detectCloud() {
+  const token = readToken();
+  try {
+    const res = await fetch(API + '/session', { method: 'GET', headers: authHeaders(token) });
+    if (res.ok) {
+      cloudAvailable = true;
+      const data = await res.json().catch(() => ({}));
+      if (data.user) state.meta.user = data.user;
+      return true;
+    }
+    if (res.status === 401) {
+      // The backend is there, nobody is signed in. A stored token that the
+      // server rejects is no longer any use.
+      cloudAvailable = true;
+      if (token) {
+        sessionToken = null;
+        writeToken(null);
+      }
+      return true;
+    }
+    cloudAvailable = false;
+    return false;
+  } catch {
+    cloudAvailable = false;
+    return false;
+  }
+}
+
+/**
+ * @returns {boolean} true when the cloud backend is configured and in use
+ */
+export const usingCloud = () => cloudAvailable && !!sessionToken;
+
+/**
+ * @returns {boolean} true when the cloud backend is configured, signed in or not
+ */
+export const cloudConfigured = () => cloudAvailable;
+
+/**
+ * Restore the previous session, if there was one.
  *
  * Players expect to stay signed in across a reload. For local accounts this
  * just remembers the username; for cloud accounts the server holds the real
- * session and this is a no-op.
+ * session and this checks the stored token against it.
  * @returns {Promise<boolean>} true when a session was restored
  */
 export async function restoreSession() {
-  if (usingCloud()) {
-    const res = await fetch('api/session', { method: 'GET', headers: authHeaders() }).catch(() => null);
+  if (cloudAvailable) {
+    const token = readToken();
+    if (!token) return false;
+    const res = await fetch(API + '/session', { method: 'GET', headers: authHeaders(token) }).catch(() => null);
     if (res && res.ok) {
       const data = await res.json().catch(() => ({}));
       if (data.user) {
+        sessionToken = token;
         state.meta.user = data.user;
         return true;
       }
     }
+    // The token was rejected or the server is unreachable — drop it and let
+    // the player sign in again rather than pretending they are signed in.
+    sessionToken = null;
+    writeToken(null);
     return false;
   }
   let name = null;
@@ -144,6 +219,7 @@ export async function restoreSession() {
 
 /**
  * Remember the signed-in local account so a reload keeps you in.
+ * @param {string} name
  */
 function rememberSession(name) {
   try {
@@ -164,9 +240,9 @@ export async function signup(name, password) {
   if (password.length < 4) return { ok: false, error: 'Password must be at least 4 characters.' };
   const key = name.toLowerCase();
 
-  if (usingCloud()) {
+  if (cloudAvailable) {
     try {
-      const res = await fetch('api/session', {
+      const res = await fetch(API + '/session', {
         method: 'POST',
         headers: authHeaders(),
         body: JSON.stringify({ action: 'signup', name, password }),
@@ -174,6 +250,7 @@ export async function signup(name, password) {
       const data = await res.json().catch(() => ({}));
       if (!res.ok) return { ok: false, error: data.error || 'Could not create the account.' };
       sessionToken = data.token;
+      writeToken(sessionToken);
       state.meta.user = key;
       return { ok: true };
     } catch {
@@ -201,9 +278,9 @@ export async function login(name, password) {
   if (password.length < 4) return { ok: false, error: 'Password must be at least 4 characters.' };
   const key = name.toLowerCase();
 
-  if (usingCloud()) {
+  if (cloudAvailable) {
     try {
-      const res = await fetch('api/session', {
+      const res = await fetch(API + '/session', {
         method: 'POST',
         headers: authHeaders(),
         body: JSON.stringify({ action: 'login', name, password }),
@@ -211,6 +288,7 @@ export async function login(name, password) {
       const data = await res.json().catch(() => ({}));
       if (!res.ok) return { ok: false, error: data.error || 'Wrong username or password.' };
       sessionToken = data.token;
+      writeToken(sessionToken);
       state.meta.user = key;
       return { ok: true };
     } catch {
@@ -231,6 +309,7 @@ export async function login(name, password) {
 /** Sign out. */
 export function logout() {
   sessionToken = null;
+  writeToken(null);
   state.meta.user = null;
   try {
     localStorage.removeItem(LS_SESSION);
@@ -246,7 +325,7 @@ export function logout() {
 export async function listSaves() {
   if (usingCloud()) {
     try {
-      const res = await fetch('api/saves', { headers: authHeaders() });
+      const res = await fetch(API + '/saves', { headers: authHeaders() });
       if (res.ok) return (await res.json()).saves || {};
     } catch {
       /* fall through to local */
@@ -266,7 +345,7 @@ export async function writeSave(save) {
   const c = state.campaign;
   if (usingCloud()) {
     try {
-      const res = await fetch('api/saves', {
+      const res = await fetch(API + '/saves', {
         method: 'POST',
         headers: authHeaders(),
         body: JSON.stringify({ difficulty: c.d, save }),
@@ -293,7 +372,7 @@ export async function writeSave(save) {
 export async function eraseSaves() {
   if (usingCloud()) {
     try {
-      await fetch('api/saves', { method: 'DELETE', headers: authHeaders() });
+      await fetch(API + '/saves', { method: 'DELETE', headers: authHeaders() });
     } catch {
       /* ignore */
     }

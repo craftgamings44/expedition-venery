@@ -25,18 +25,22 @@ affects feel, read V8. The port is only faithful where it matches it.
   `world/` (tiles, generator, pathfind), `entities/` (player, monster), `systems/`
   (mining, spawnlock, inventory, economy, progression, quest, telegraph), `state/`
   (store, selectors, save), `render/`, `audio/`, `ui/`, `services/accounts.js`, plus
-  `api/index.js` (Vercel function) and `src/main.js` (composition root).
-- **839 headless tests pass, 0 fail** — `node tests/run.js`.
+  `api/` (Vercel function: `index.js`, `[...path].js`, `db.js`) and `src/main.js`
+  (composition root).
+- **906 headless tests pass, 0 fail** — `node tests/run.js`. The new ones cover the
+  accounts client and the API's routing and auth rules.
 - **`tools/probe.html`** boots the real game in a browser and plays an expedition through
   genuine keyboard and mouse events, reporting a pass/fail checklist. Serve with
   `node tools/serve.js` and open `http://localhost:8080/tools/probe.html`.
 - **42 AI-generated art assets** (~7 MB) under `assets/`, all with procedural fallbacks.
   Regenerate any of them with the `mmx` CLI — see `assets/PROMPTS.md`.
-- Accounts work against a local fallback; the cloud path needs `DATABASE_URL` for the
-  serverless API. Without it the client silently uses local storage.
+- **The cloud account path works.** `node tools/serve.js` serves the game *and* the API
+  from one process, so local and production run the same handler. The database is
+  Postgres — Supabase, free tier — and `DATABASE_URL` in `.env` points at it.
+  `node tools/api-check.js <url>` exercises the whole API against any server.
 
-Last commit: `b32f315` "V9: the port — depth biomes, emerald, and a working expedition
-loop". The whole V9 engine is committed and pushed.
+Last commit: `3394f4a` "Add a handoff prompt so a fresh session can pick the project up
+cold", plus the cloud-path work described below.
 
 ## The decisions that are already made
 
@@ -57,6 +61,32 @@ loop". The whole V9 engine is committed and pushed.
 - **Save format** — versioned, with a migration chain. A missing `v` is a V8-era save and
   migrates forward. Never change a save shape without a migration.
 
+## What changed in the cloud-path pass
+
+The cloud accounts were **unreachable**, for three separate reasons, all fixed:
+
+1. `detectCloud()` read a **401** as "there is no backend". The server answers 401 when
+   nobody is signed in and 503 when it is not configured — different answers, and the
+   client now tells them apart. Before the fix the client always fell back to local
+   accounts, so the backend could never be used.
+2. The client asked for `api/session` — a **relative** URL. From `/index.html` that
+   resolves correctly, but from `/tools/probe.html` it resolves to `/tools/api/session`
+   and 404s. Every call now uses `/api/...`.
+3. The session token lived only in a module variable, so a reload dropped the cloud
+   session. It is now kept in `localStorage` under `ev_cloud_token`.
+
+Also: `api/index.js` imported `pg` without it ever being in `package.json`, so with
+`DATABASE_URL` set the function threw *outside* its try block and returned a raw 500.
+The schema bootstrap now runs once per cold start instead of on every request, there is
+a `GET /api/health` route, and auth attempts are rate limited per IP.
+
+`api/[...path].js` is a catch-all that re-exports the handler. Without it Vercel maps
+`api/index.js` to `/api` only, and `/api/session` 404s in production — the local dev
+server routes straight to the handler and never noticed.
+
+`pg` is the **only** npm dependency and it belongs to the serverless function. The game
+itself has no dependencies and no build step.
+
 ## The traps that will bite you
 
 1. **The probe owns the clock.** A browser tab nobody is looking at freezes its
@@ -76,7 +106,9 @@ loop". The whole V9 engine is committed and pushed.
    `node tools/serve.js 8080` and check it is up before opening the probe.
 5. **Git identity** is repo-local: `Craftgammings44 / craftgamings44@users.noreply.github.com`.
 6. **Secrets** — the `mmx` API key lives only in `~/.mmx/config.json`. Never print it,
-   never pass it on a command line.
+   never pass it on a command line. `DATABASE_URL` holds the database password: it lives
+   in `.env` (gitignored) and in the Vercel environment, and nowhere else. Never paste it
+   into chat or a commit.
 
 ## Known gaps
 
@@ -85,7 +117,8 @@ loop". The whole V9 engine is committed and pushed.
   "ore delivered" checks can fail while everything else passes. The game itself is fine —
   the probe's navigation is the weak part. Fixing it means making its dig route pick
   better goals and keeping it from walking into holes.
-- No Postgres is provisioned, so the cloud account path is untested end to end.
+- The Supabase project and the Vercel deployment still have to be created by hand (both
+  need an account). Everything on this side of them is done and tested.
 - The campaign's later quests and the paid-job loop have only been exercised in the
   first quest.
 - `tests/pathfind.test.js` was rewritten to be layout-independent; the cave layout is
@@ -96,10 +129,9 @@ loop". The whole V9 engine is committed and pushed.
 The natural next pieces, in the order I would take them:
 
 1. Make the probe fill a quota, so the delivery path is covered end to end.
-2. Provision a database and exercise the cloud account path across two devices.
-3. Play the late game — quests 6 to 10 are where emeralds and diamonds live, and the
+2. Play the late game — quests 6 to 10 are where emeralds and diamonds live, and the
    monster variants have never been seen in a real run.
-4. The remaining headline content: monster variants per biome, and the camp buildings
+3. The remaining headline content: monster variants per biome, and the camp buildings
    earning their keep.
 
 Ask me which one. If I do not say, take the first.

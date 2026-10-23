@@ -8,16 +8,90 @@ game core. Deploys to Vercel free tier straight from this repository.
 
 ## Play
 
-Open `index.html` in a browser, or run a local server:
+Run the local server — it serves the game **and** the accounts API, so local and
+production behave the same way:
 
 ```bash
-npx serve .          # or: python -m http.server 8000
+node tools/serve.js
 ```
 
-Then visit the served URL.
+Then open <http://localhost:8080/>.
 
 > **Note:** the game uses native ES modules. Opening `index.html` directly via `file://`
 > will be blocked by browser CORS rules — use a local HTTP server.
+
+## Accounts
+
+The game works offline with a local account. When a database is configured, the same
+interface is used with the data on the server, so a campaign follows you across devices.
+Without one the client falls back to local storage automatically — nothing to configure
+to play.
+
+The backend is one Vercel serverless function in `api/`, backed by Postgres. Supabase is
+the easiest way to get that database: create a project, copy the **Session pooler**
+connection string, and put it in `.env`:
+
+```
+DATABASE_URL=postgresql://postgres.PROJECTREF:PASSWORD@aws-0-REGION.pooler.supabase.com:5432/postgres
+```
+
+The schema is created on first request, so there is no migration to run.
+
+The API takes `Bearer` tokens. A session lasts 30 days; the client keeps the token in
+`localStorage`, so a reload stays signed in and a second device picks up where the first
+left off.
+
+## Local and production
+
+The same `api/index.js` handler runs in both places — the dev server adapts Node's
+request and response objects to it, and Vercel calls it directly. There is no second
+implementation to drift.
+
+**Local test server** — one command, game and API together:
+
+```bash
+npm install                # once: installs pg for the API
+node tools/serve.js        # http://localhost:8080
+```
+
+`tools/serve.js` reads `DATABASE_URL` from `.env` (see `.env.example`). With no
+`DATABASE_URL` it still runs, and the game falls back to per-device local accounts.
+
+Check the API end to end against any server — local or deployed:
+
+```bash
+node tools/api-check.js http://localhost:8080
+node tools/api-check.js https://your-deployment.vercel.app
+```
+
+**Production on Vercel** — the repo is the deployable artifact, there is no build step:
+
+```bash
+npm install
+npx vercel login
+npx vercel link
+npx vercel env add DATABASE_URL production     # paste the Supabase connection string
+npx vercel deploy --prod
+```
+
+The only npm dependency is `pg`, used by the serverless function. The game itself has no
+dependencies and no build step.
+
+
+The backend is one Vercel serverless function in `api/`, backed by Postgres. Supabase is
+the easiest way to get that database: create a project, copy the **Session pooler**
+connection string, and put it in `.env`:
+
+```
+DATABASE_URL=postgresql://postgres.PROJECTREF:PASSWORD@aws-0-REGION.pooler.supabase.com:5432/postgres
+```
+
+The schema is created on first request, so there is no migration to run.
+
+The API takes `Bearer` tokens. A session lasts 30 days; the client keeps the token in
+`localStorage`, so a reload stays signed in and a second device picks up where the first
+left off.
+
 
 ## The game
 
@@ -55,9 +129,12 @@ src/                    native ES modules — the game
   ui/                   DOM panels
   services/             accounts — local storage or the cloud API
 api/                    Vercel serverless function (accounts + saves)
+  index.js              the only implementation of the API
+  [...path].js          catch-all so /api/* reaches that one function
+  db.js                 Postgres access layer
 assets/                 AI-generated icons, UI art, creature portraits, biome art
 tests/                  headless Node test harness (no framework)
-tools/                  dev utilities (static server, browser probe)
+tools/                  dev utilities (dev server, API adapter, API check, browser probe)
 reference/              the original single-file prototype
 ARCHITECTURE.md         the V9 architecture proposal and delivery plan
 ```
@@ -77,7 +154,7 @@ Core rules:
 
 ```bash
 node tests/run.js      # headless test suite (zero dependencies)
-node tools/serve.js    # static dev server on http://localhost:8080
+node tools/serve.js    # dev server on http://localhost:8080 — game and API
 ```
 
 ### Verifying a change
@@ -86,7 +163,8 @@ Two harnesses, and they cover different things:
 
 - **`node tests/run.js`** — the simulation core, headless: world generation determinism,
   pathfinding, the input layer, the monster's sound-hunting, the spawn lock, biome
-  strata, ore rarity, save round-trip and migration, and economy invariants.
+  strata, ore rarity, save round-trip and migration, economy invariants, the accounts
+  client and the API's routing and auth rules.
 - **`tools/probe.html`** — the whole game in a real browser. It boots the real game and
   plays one expedition end to end (descend → mine → get hunted → come home and deliver),
   driving the game through genuine keyboard and mouse events, then reports every step as

@@ -6,12 +6,18 @@
  * printed URL.
  *
  *   node tools/serve.js [port]
+ *
+ * It also serves the cloud accounts API at /api/*, using the same handler the
+ * Vercel deployment uses, so local and production behave identically. Point
+ * it at a database with DATABASE_URL in a .env file (see .env.example).
  */
 
 import http from 'node:http';
 import { readFile, stat } from 'node:fs/promises';
 import { join, extname, normalize, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { loadEnv } from './env.js';
+import { handleApi } from './api-local.js';
 
 const ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const PORT = Number(process.argv[2]) || 8080;
@@ -33,10 +39,17 @@ const TYPES = {
 };
 
 const server = http.createServer(async (req, res) => {
+  const path = decodeURIComponent((req.url || '/').split('?')[0]);
+
+  if (path === '/api' || path.startsWith('/api/')) {
+    await handleApi(req, res);
+    return;
+  }
+
   try {
-    let path = decodeURIComponent((req.url || '/').split('?')[0]);
-    if (path.endsWith('/')) path += 'index.html';
-    const full = join(ROOT, normalize(path).replace(/^(\.\.[/\\])+/, ''));
+    let p = path;
+    if (p.endsWith('/')) p += 'index.html';
+    const full = join(ROOT, normalize(p).replace(/^(\.\.[/\\])+/, ''));
     if (!full.startsWith(ROOT)) {
       res.writeHead(403).end('Forbidden');
       return;
@@ -58,6 +71,14 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+const loaded = await loadEnv();
+
 server.listen(PORT, () => {
   console.log(`Expedition Venery running at http://localhost:${PORT}/`);
+  if (process.env.DATABASE_URL) {
+    console.log('Cloud accounts: enabled (DATABASE_URL is set).');
+  } else {
+    console.log('Cloud accounts: local only (no DATABASE_URL).');
+  }
+  if (loaded.length) console.log(`Loaded from .env: ${loaded.join(', ')}`);
 });

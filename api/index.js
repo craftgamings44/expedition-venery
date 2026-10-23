@@ -4,35 +4,62 @@
  * One function handles every route so the deployment stays inside the Hobby
  * plan's per-deployment function count.
  *
+ *   GET    /api/health    -> is the backend configured and reachable
  *   GET    /api/session   -> who am I
  *   POST   /api/session   -> signup | login
  *   GET    /api/saves     -> all saves for the signed-in user
  *   POST   /api/saves     -> write one save
  *   DELETE /api/saves     -> erase all saves
  *
- * Storage: a Postgres database pointed at by DATABASE_URL (Neon, Supabase and
- * Vercel Postgres all work). If DATABASE_URL is not set the function reports
- * that cloud accounts are unconfigured, and the client falls back to local
- * accounts — the game never breaks because the backend is missing.
+ * Storage: a Postgres database pointed at by DATABASE_URL (Neon, Supabase,
+ * Vercel Postgres and a local database all work). If DATABASE_URL is not set
+ * the function reports that cloud accounts are unconfigured, and the client
+ * falls back to local accounts — the game never breaks because the backend is
+ * missing.
  *
  * Passwords are hashed server-side with scrypt. The client never sees a hash.
  */
 
 import crypto from 'node:crypto';
+import { getPool, isConfigured } from './db.js';
 
-/** @type {import('@vercel/node').VercelRequest|undefined} */
-let cachedPg = null;
+/** Cached schema bootstrap — one round trip per cold start, not per request. */
+let schemaPromise = null;
+
+/** @type {Map<string, {n: number, until: number}>} */
+const attempts = new Map();
+
+/** Auth attempts allowed per IP per window. */
+const AUTH_LIMIT = 20;
+const AUTH_WINDOW_MS = 10 * 60 * 1000;
 
 /**
- * Lazily create a pg Pool. Returns null when the database is not configured.
+ * Read the caller's IP for rate limiting.
+ * @param {import('@vercel/node').VercelRequest} req
+ * @returns {string}
  */
-async function getPool() {
-  const url = process.env.DATABASE_URL;
-  if (!url) return null;
-  if (cachedPg) return cachedPg;
-  const { default: pg } = await import('pg');
-  cachedPg = new pg.Pool({ connectionString: url, ssl: url.includes('sslmode=disable') ? false : { rejectUnauthorized: false } });
-  return cachedPg;
+function clientIp(req) {
+  const h = req.headers['x-forwarded-for'];
+  const v = Array.isArray(h) ? h[0] : h;
+  return String(v || req.socket?.remoteAddress || 'unknown').split(',')[0].trim();
+}
+
+/**
+ * Count an auth attempt for this IP. Returns false when the caller is over
+ * the limit.
+ * @param {import('@vercel/node').VercelRequest} req
+ * @returns {boolean}
+ */
+function allowAuth(req) {
+  const now = Date.now();
+  const ip = clientIp(req);
+  const rec = attempts.get(ip);
+  if (!rec || rec.until < now) {
+    attempts.set(ip, { n: 1, until: now + AUTH_WINDOW_MS });
+    return true;
+  }
+  rec.n += 1;
+  return rec.n <= AUTH_LIMIT;
 }
 
 /**
@@ -68,7 +95,7 @@ async function verifyPassword(password, stored) {
 
 /**
  * Create the schema if it does not exist.
- * @param {import('pg').Pool} pool
+ * @param {any} pool
  */
 async function ensureSchema(pool) {
   await pool.query(`
@@ -105,8 +132,24 @@ function bearer(req) {
 }
 
 /**
+ * Parse a JSON body. Vercel hands over an object for JSON content types and a
+ * raw string otherwise; the local dev server always hands over a string.
+ * @param {any} raw
+ * @returns {Object}
+ */
+function parseBody(raw) {
+  if (!raw) return {};
+  if (typeof raw === 'object') return raw;
+  try {
+    return JSON.parse(String(raw) || '{}') || {};
+  } catch {
+    return {};
+  }
+}
+
+/**
  * Look up the user id for a bearer token.
- * @param {import('pg').Pool} pool
+ * @param {any} pool
  * @param {string|null} token
  * @returns {Promise<number|null>}
  */
@@ -117,16 +160,39 @@ async function userForToken(pool, token) {
 }
 
 /**
+ * The last segment of the request path: /api/session -> session.
+ * @param {string} url
+ * @returns {string}
+ */
+function route(url) {
+  const parts = String(url || '').split('?')[0].split('/').filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : '';
+}
+
+/**
  * Handle the request.
  * @param {import('@vercel/node').VercelRequest} req
  * @param {import('@vercel/node').VercelResponse} res
  */
 export default async function handler(req, res) {
   res.setHeader('Content-Type', 'application/json');
-  const url = (req.url || '').split('?')[0];
+  const path = route(req.url);
 
-  const pool = await getPool();
-  if (!pool) {
+  if (path === 'health') {
+    // The client probes this to tell "no backend" apart from "not signed in".
+    res.status(isConfigured() ? 200 : 503).json({
+      ok: isConfigured(),
+      configured: isConfigured(),
+      service: 'expedition-venery',
+    });
+    return;
+  }
+
+  let pool = null;
+  try {
+    pool = await getPool();
+  } catch (err) {
+    console.error('api database unavailable', err);
     res.status(503).json({
       error: 'Cloud accounts are not configured on this deployment.',
       hint: 'Set DATABASE_URL to a Postgres connection string to enable them.',
@@ -135,9 +201,15 @@ export default async function handler(req, res) {
   }
 
   try {
-    await ensureSchema(pool);
+    if (!schemaPromise) {
+      schemaPromise = ensureSchema(pool).catch((err) => {
+        schemaPromise = null;
+        throw err;
+      });
+    }
+    await schemaPromise;
 
-    if (url.endsWith('/session')) {
+    if (path === 'session') {
       if (req.method === 'GET') {
         const uid = await userForToken(pool, bearer(req));
         if (!uid) {
@@ -150,7 +222,11 @@ export default async function handler(req, res) {
       }
 
       if (req.method === 'POST') {
-        const body = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : req.body || {};
+        if (!allowAuth(req)) {
+          res.status(429).json({ error: 'Too many attempts. Wait a few minutes and try again.' });
+          return;
+        }
+        const body = parseBody(req.body);
         const action = body.action;
         const name = String(body.name || '').trim();
         const password = String(body.password || '');
@@ -195,7 +271,7 @@ export default async function handler(req, res) {
       }
     }
 
-    if (url.endsWith('/saves')) {
+    if (path === 'saves') {
       const uid = await userForToken(pool, bearer(req));
       if (!uid) {
         res.status(401).json({ error: 'Not signed in.' });
@@ -209,7 +285,7 @@ export default async function handler(req, res) {
         return;
       }
       if (req.method === 'POST') {
-        const body = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : req.body || {};
+        const body = parseBody(req.body);
         const difficulty = String(body.difficulty || 'normal');
         await pool.query(
           `INSERT INTO ev_saves (user_id, difficulty, data, updated_at)
