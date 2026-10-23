@@ -1,0 +1,160 @@
+/* Expedition Venery — UI styles.
+   The game world is canvas; the panels are DOM. */
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: #070a0f;
+  overflow: hidden;
+  font: 16px Georgia, 'Times New Roman', serif;
+  color: #e9f0f6;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+#c, #ui {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: min(100vw, 177.78vh);
+  height: min(56.25vw, 100vh);
+}
+
+#c { display: block; image-rendering: pixelated; }
+
+#ui {
+  pointer-events: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: .9em;
+  font-size: calc(min(100vw, 177.78vh) / 62);
+}
+
+#ui > * { pointer-events: auto; }
+
+h1 {
+  font: 700 3.1em/1 Georgia;
+  letter-spacing: .08em;
+  margin: 0 0 .4em;
+  color: #f3f8fc;
+  text-shadow: 0 .07em 0 #2b4258, 0 0 .6em #6aa4d0;
+  text-align: center;
+  white-space: nowrap;
+}
+
+button {
+  font: 700 1.5em Georgia;
+  color: #eaf3fa;
+  background: #1c2b3a;
+  border: 2px solid #5b88ad;
+  border-radius: .4em;
+  padding: .35em 1.6em;
+  min-width: 9em;
+  cursor: pointer;
+  font-family: Georgia, serif;
+}
+
+button:hover:not(:disabled) { background: #2c4660; }
+button:disabled { opacity: .4; cursor: not-allowed; }
+
+.pn {
+  background: #0d1620f2;
+  border: 2px solid #44667f;
+  border-radius: .6em;
+  padding: 1em 1.5em;
+  max-height: 92%;
+  overflow: auto;
+  min-width: 28em;
+  font-size: 1em;
+}
+
+.pn.w { min-width: 58em; }
+.pn h2 { margin: .1em 0 .5em; }
+
+.r {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1.2em;
+  margin: .35em 0;
+}
+
+.r button { font-size: 1em; min-width: 6em; padding: .15em .6em; }
+.r small { opacity: .7; display: block; }
+
+a { color: #8fb7d6; cursor: pointer; font-size: 1.1em; }
+
+#sg {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1.4em;
+}
+
+h3 { margin: .5em 0 .2em; }
+
+.it {
+  display: flex;
+  align-items: center;
+  gap: .7em;
+  margin: .3em 0;
+  padding: .3em .5em;
+  border: 1px solid #2c4256;
+  border-radius: .4em;
+}
+
+.it i {
+  width: 1.5em;
+  height: 1.5em;
+  border-radius: .3em;
+  flex: none;
+  border: 2px solid #111;
+}
+
+/* AI-generated icons sit in the same slot as the colour swatches. The
+   background colour is always set inline, so a missing image still shows
+   something in the right place. */
+.it img.ico {
+  width: 1.5em;
+  height: 1.5em;
+  border-radius: .3em;
+  flex: none;
+  border: 2px solid #111;
+  object-fit: cover;
+  background-size: cover;
+  image-rendering: auto;
+}
+
+.it span { flex: 1; }
+.it small { display: block; opacity: .75; font-size: .8em; }
+.it.eq { border-color: #8fe; background: #12303a; }
+.it button { font-size: 1em; min-width: 6.5em; padding: .2em .5em; }
+
+input[type=text], input[type=password] {
+  display: block;
+  width: 92%;
+  margin: .45em auto;
+  padding: .4em .6em;
+  font: 1.15em Georgia, serif;
+  color: #eaf3fa;
+  background: #0a1118;
+  border: 2px solid #44667f;
+  border-radius: .35em;
+  outline: none;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+input[type=text]:focus, input[type=password]:focus { border-color: #8fb7d6; }
+
+input[type=range] { width: 50%; accent-color: #5b88ad; }
+
+#er { min-height: 1.3em; color: #ff8a7a; margin: .3em 0; font-size: .95em; }
+.ok { color: #8fe !important; }
+
+.who { opacity: .8; margin: 0; }
+.tab.on { background: #2c4660; border-color: #8fe; }
+.diff { display: block; margin: .3em auto; }
+.diff small { display: block; opacity: .7; font-weight: 400; font-size: .55em; }

@@ -22,10 +22,21 @@ Then visit the served URL.
 ## The game
 
 - **Procedurally generated caves** — deterministic per seed, every run is different but reproducible.
+- **Depth biomes** — the mountain is stratified into five strata: Shale Veins, Ember Shafts, Magma Vaults, Glacial Deep and The Abyss. Each has its own rock, ore table, hazards, light radius and monster speed. Going deeper genuinely changes what you find. The strata are measured from the elevator pad, so you always land in the first one.
+- **Six ores, from copper to diamond** — copper, iron and gold near the top; rubies in the middle; **emeralds** (green, the second most valuable) in the cold deep; and diamonds, the rarest thing in the mountain, below them. Emerald turns up at the rate diamonds used to, and diamonds are three times rarer than that — a prize, not a rumour.
 - **A monster that hunts by sound** — it cannot see through rock. It hears your pickaxe, remembers where it heard you, and learns the direction you flee. Stay silent behind stone and it won't know you exist.
+- **Three monster variants** — The Watcher, the Hound and the Burrower, each with its own senses, speed and starting adaptations.
+- **A camp and a skill tree** — build a workbench, forge, ward, bunk and lookout at the surface, and spend skill points across three branches.
 - **Ten-quest story** for Mack, then endless paid jobs.
 - **Progression** — pickaxes, mining luck, ropes, grappling hooks, decoys, and a cave-item economy.
 - **Real risk** — if it catches you, you lose your pack. Your body ends up in its lair. Go back for it.
+
+## Accounts
+
+The game works offline with a local account. If a database is configured (`DATABASE_URL`
+for the serverless API in `api/`), the same interface is used with the data on the server,
+so a campaign follows you across devices. Without one, the client falls back to local
+storage automatically — nothing to configure to play.
 
 ## Project layout
 
@@ -38,17 +49,17 @@ src/                    native ES modules — the game
   data/                 pure content tables (ores, biomes, monsters, quests…)
   world/                generation, tiles, pathfinding
   entities/             player, monster AI
-  systems/              mining, noise, inventory, economy, camp, skills
+  systems/              mining, spawn lock, inventory, economy, camp, skills
   render/               canvas rendering, lighting, HUD, art loader
   audio/                procedural WebAudio (no audio files)
   ui/                   DOM panels
-  services/             accounts + cloud (local impl now, API later)
-assets/                 AI-generated icons, UI art, creature portraits
-api/                    Vercel serverless functions (later phase)
+  services/             accounts — local storage or the cloud API
+api/                    Vercel serverless function (accounts + saves)
+assets/                 AI-generated icons, UI art, creature portraits, biome art
 tests/                  headless Node test harness (no framework)
-tools/                  dev utilities (art generation, browser probe)
+tools/                  dev utilities (static server, browser probe)
 reference/              the original single-file prototype
-docs/                   architecture proposal and notes
+ARCHITECTURE.md         the V9 architecture proposal and delivery plan
 ```
 
 ## Architecture
@@ -66,7 +77,43 @@ Core rules:
 
 ```bash
 node tests/run.js      # headless test suite (zero dependencies)
+node tools/serve.js    # static dev server on http://localhost:8080
 ```
+
+### Verifying a change
+
+Two harnesses, and they cover different things:
+
+- **`node tests/run.js`** — the simulation core, headless: world generation determinism,
+  pathfinding, the input layer, the monster's sound-hunting, the spawn lock, biome
+  strata, ore rarity, save round-trip and migration, and economy invariants.
+- **`tools/probe.html`** — the whole game in a real browser. It boots the real game and
+  plays one expedition end to end (descend → mine → get hunted → come home and deliver),
+  driving the game through genuine keyboard and mouse events, then reports every step as
+  a pass/fail checklist. Open it against the dev server:
+
+  ```bash
+  node tools/serve.js
+  # then open http://localhost:8080/tools/probe.html
+  ```
+
+  It also logs any uncaught error or `console.error`, so a crash shows up as a failed
+  check rather than a black screen.
+
+  Two things to know before you change it:
+
+  - **The probe owns the clock.** A browser tab nobody is looking at freezes its
+    animation frames and clamps `setTimeout` to a second, so a wall-clock wait starves
+    the game and every in-game timer looks like a hang. The probe sets `__evDrive`,
+    ticks the game itself through `window.__evTick(frames)`, and measures every budget
+    in **frames of game time**, never in milliseconds. Keep it that way.
+  - **It is a mediocre player.** It digs a route to the nearest vein and mines it, but
+    it does not yet fill a full quota in one expedition, so the "quota mined" and
+    "delivered" checks can fail while everything else passes. Treat those two as
+    known, and read the rest of the checklist.
+
+Anything touching canvas rendering is verified in the browser; everything else is
+verified headlessly.
 
 ## Art pipeline
 

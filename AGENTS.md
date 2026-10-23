@@ -30,9 +30,22 @@ modules. No bundler, no framework in the game core, no runtime dependencies.
   accumulates memory of sound sources and investigates them.
 - The monster **learns**: it remembers where it heard you and which way you fled, and uses
   that on later hunts.
+- The monster **sleeps** for the first minute after you go down (`src/systems/spawnlock.js`).
+  It neither moves nor hears during that time, and the countdown only runs while you are
+  underground. It wakes with a growl, and it will camp the elevator once it knows you were
+  loud near the pad.
 - Dying costs you your pack. Your body stays in the lair and can be recovered — by you,
   if you dare go back.
 - You cannot dig upward. That constraint is fundamental to the genre.
+- **The depth strata are anchored to the elevator pad**, not to the difficulty's nominal
+  cave start. The pad is where the elevator sets you down, so anchoring to it guarantees
+  you always arrive in the first stratum — where quest one's copper grows. Anchoring to
+  `D.st` dropped the pad into the second stratum on easy and hard, and the first quest
+  became impossible.
+- **Emerald carries the weight diamonds used to carry**, in both the biome ore tables and
+  the per-difficulty lucky-find weights. Diamonds are rarer than that — roughly a third of
+  the old rate. If you retune one, retune the other, or a stratum will stop yielding the
+  gem the quests ask for.
 
 ## Save format
 
@@ -47,12 +60,27 @@ node tests/run.js
 ```
 
 The harness is dependency-free on purpose (Node is the only requirement). Tests cover the
-simulation core: world generation determinism, pathfinding, monster AI state transitions,
-save round-trip and migration, and economy invariants.
+simulation core: world generation determinism, pathfinding, the input layer, the monster's
+sound-hunting and state transitions, the spawn lock, biome strata, ore rarity, save
+round-trip and migration, and economy invariants.
 
-Anything touching canvas rendering is verified in a real browser instead. `tools/probe.html`
-is an instrumented harness that boots the game, drives a scripted sequence, and reports
-thrown errors and console output — use it to verify gameplay changes.
+Anything touching canvas rendering is verified in a real browser instead.
+`tools/probe.html` is an instrumented harness that boots the real game and plays one
+expedition end to end — descend, mine, get hunted, come home and deliver — driving the
+game through genuine keyboard and mouse events and reporting every step as a pass/fail
+checklist. Serve the repo (`node tools/serve.js`) and open
+`http://localhost:8080/tools/probe.html`.
+
+**The probe owns the clock.** A tab nobody is looking at freezes its animation frames and
+clamps `setTimeout` to a second, so a wall-clock budget starves the game and every
+in-game timer looks like a hang. The probe sets `__evDrive`, drives the game through
+`window.__evTick(frames)`, and counts every budget in **frames of game time**. It also
+yields to the event loop with a `MessageChannel` between frames — a microtask-only loop
+never lets the game's own asset loading finish, and the boot silently stalls.
+
+Use both. A change that passes the headless suite can still be broken in the browser, and
+vice versa — the input layer and the tween loop have each broken in one and looked fine in
+the other.
 
 ## Conventions
 
@@ -66,5 +94,8 @@ thrown errors and console output — use it to verify gameplay changes.
 - `reference/Expedition_VeneryV8.html` — the original single-file prototype (V8).
   It is the source of truth for **gameplay behaviour** during the port, and the baseline
   for comparison when refactoring. Read it before changing anything that affects feel.
+  It is dense, but it is complete: the spawn lock, the tween semantics and the monster's
+  hearing rules all live in there, and the port is only faithful where it matches.
 - `ARCHITECTURE.md` — the V9 architecture proposal and delivery plan.
-- `tools/Expedition_VeneryV8.original.html` — pristine copy of the prototype for diffing.
+- `tools/baseline-probe.html` — the V8 audit harness used to measure the prototype before
+  the port.

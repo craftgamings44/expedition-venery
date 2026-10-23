@@ -1,0 +1,12 @@
+{
+  "biome.banner.shale": "assets/biomes/banner_shale.png",
+  "biome.banner.ember": "assets/biomes/banner_ember.png",
+  "biome.banner.magma": "assets/biomes/banner_magma.png",
+  "biome.banner.glacial": "assets/biomes/banner_glacial.png",
+  "biome.banner.abyss": "assets/biomes/banner_abyss.png",
+  "biome.backdrop.shale": "assets/biomes/backdrop_shale.png",
+  "biome.backdrop.ember": "assets/biomes/backdrop_ember.png",
+  "biome.backdrop.magma": "assets/biomes/backdrop_magma.png",
+  "biome.backdrop.glacial": "assets/biomes/backdrop_glacial.png",
+  "biome.backdrop.abyss": "assets/biomes/backdrop_abyss.png"
+}

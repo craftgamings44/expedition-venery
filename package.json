@@ -1,0 +1,15 @@
+{
+  "name": "expedition-venery",
+  "version": "9.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A 2D mining-horror game. Zero-build static web app — native ES modules, no bundler, no framework in the game core.",
+  "license": "MIT",
+  "scripts": {
+    "test": "node tests/run.js",
+    "dev": "node tools/serve.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

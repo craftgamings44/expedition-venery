@@ -1,0 +1,1183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Expedition Venery — automated playthrough</title>
+<!-- The probe lives in tools/ but hosts the game, whose asset manifest uses
+     paths relative to the site root. -->
+<base href="/">
+<link rel="stylesheet" href="/styles/game.css">
+<style>
+  /* The probe needs to scroll and to lay the game out at its native size,
+     so it overrides the full-screen game chrome. */
+  html, body { height: auto; overflow: auto; }
+  body { padding: 1.5rem; max-width: 72rem; margin: 0 auto; }
+  h1 { font-size: 1.9rem; margin: 0 0 .3em; }
+  p.lede { opacity: .8; margin: 0 0 1em; }
+  #stage { position: relative; width: 960px; height: 540px; margin: 0 0 1em; border: 1px solid #34506b; border-radius: .3em; }
+  #c, #ui { position: absolute; left: 0; top: 0; transform: none; width: 960px; height: 540px; }
+  #ui { font-size: 15px; }
+  #verdict { font: 700 1.1rem Georgia, serif; padding: .3em .8em; border-radius: .3em; display: inline-block; margin-bottom: .8em; }
+  #verdict.pass { background: #12303a; color: #8fe; border: 1px solid #2f7d63; }
+  #verdict.fail { background: #3a0f12; color: #ff9a9a; border: 1px solid #7d2f36; }
+  #verdict.run  { background: #1c2b3a; color: #cfe; border: 1px solid #5b88ad; }
+  pre { background: #0a1118; border: 1px solid #44667f; border-radius: .4em; padding: 1em; overflow: auto; white-space: pre-wrap; font-size: .8rem; line-height: 1.5; max-height: 30em; }
+  .ok { color: #8fe; } .bad { color: #ff8a7a; } .dim { color: #7d8fa0; }
+</style>
+</head>
+<body>
+<h1>Expedition Venery — automated playthrough</h1>
+<p class="lede">
+  Boots the real game and plays one expedition end to end: take the elevator down, mine the
+  quota, get hunted by the thing that hunts by sound, then come home and deliver.
+  Everything here drives the game through real DOM events — the same code path a player uses.
+</p>
+<div id="verdict" class="run">idle</div>
+<pre id="log">idle</pre>
+
+<div id="stage">
+  <canvas id="c" width="960" height="540"></canvas>
+  <div id="ui"></div>
+</div>
+
+<script type="module">
+/**
+ * The playthrough probe.
+ *
+ * AGENTS.md calls for gameplay changes to be verified with an instrumented
+ * harness. This one plays the whole loop: it boots the real game, dispatches
+ * genuine keyboard and mouse events, and reports every step.
+ *
+ * It deliberately does not reach into the simulation to cheat — walking,
+ * mining and the elevator are all driven through the game's own input layer.
+ */
+
+import { state } from '../src/state/store.js';
+import { WW, SF, T } from '../src/core/constants.js';
+import { findPath } from '../src/world/pathfind.js';
+import { aim } from '../src/entities/player.js';
+import { mouse } from '../src/core/input.js';
+import { ORE_IDS } from '../src/data/ores.js';
+import { currentTask, canDeliver } from '../src/state/selectors.js';
+
+const logEl = document.getElementById('log');
+const verdictEl = document.getElementById('verdict');
+const canvas = document.getElementById('c');
+
+const errors = [];
+const checks = [];
+let logText = '';
+
+function log(msg, cls) {
+  logText += (logText ? '\n' : '') + msg;
+  logEl.textContent = logText;
+  if (cls === 'ok') logEl.className = 'ok';
+  else if (cls === 'bad') logEl.className = 'bad';
+}
+function dim(msg) { log('  ' + msg, 'dim'); }
+function check(name, ok, detail) {
+  checks.push({ name, ok: !!ok });
+  log((ok ? 'PASS  ' : 'FAIL  ') + name + (detail ? '   — ' + detail : ''), ok ? 'ok' : 'bad');
+}
+
+window.addEventListener('error', (e) => {
+  errors.push('onerror: ' + e.message + ' @' + (e.filename || '').split('/').pop() + ':' + e.lineno);
+  log('ERROR ' + errors[errors.length - 1], 'bad');
+});
+window.addEventListener('unhandledrejection', (e) => {
+  errors.push('rejection: ' + (e.reason && e.reason.message ? e.reason.message : e.reason));
+  log('ERROR ' + errors[errors.length - 1], 'bad');
+});
+const realError = console.error.bind(console);
+console.error = function () {
+  const m = Array.from(arguments).map((a) => (a && a.message) ? a.message : String(a)).join(' ');
+  errors.push(m);
+  log('ERROR ' + m, 'bad');
+  realError.apply(null, arguments);
+};
+
+/* ------------------------------------------------------------------ *
+ * Driving the game
+ * ------------------------------------------------------------------ */
+
+/**
+ * Keep the game responsive.
+ *
+ * The game pauses itself when the window loses focus, and the blur handler
+ * refuses to fire while a dialogue is up, so a probe can find itself paused
+ * with no panel on screen. This is the player-equivalent of coming back to
+ * the tab: press Resume, or dismiss a panel that is in the way.
+ */
+function keepPlaying() {
+  if (state.ui.paused) document.getElementById('btnResume')?.click();
+  if (state.ui.modal && !document.querySelector('#ui .pn')) {
+    keyDown('Escape');
+    keyUp('Escape');
+  }
+}
+
+/** Frames of game time in one second. */
+const FPS = 60;
+/** Seconds of game time as a frame budget. */
+const sec = (s) => Math.max(1, Math.round(s * FPS));
+/**
+ * Frames of game time the probe has driven so far.
+ *
+ * Every budget in this file is measured against this counter, so a timeout
+ * means "this much game time passed" rather than "this much wall-clock time
+ * passed" — which, in a tab nobody is looking at, is not the same thing.
+ */
+let gameTime = 0;
+
+/**
+ * Yield to the browser's event loop.
+ *
+ * The game's boot loads its asset manifest over the network and finishes in a
+ * task, not a microtask. A probe whose whole loop is microtasks never lets the
+ * event loop turn, so the boot never finishes and the title screen never
+ * appears. A MessageChannel is used rather than setTimeout because a tab
+ * nobody is looking at has its timers clamped to a second.
+ */
+const taskChannel = new MessageChannel();
+let taskPending = null;
+taskChannel.port1.onmessage = () => {
+  const done = taskPending;
+  taskPending = null;
+  if (done) done();
+};
+function yieldToTask() {
+  return new Promise((res) => {
+    taskPending = res;
+    taskChannel.port2.postMessage(0);
+  });
+}
+
+/**
+ * Advance the game by n frames of game time.
+ *
+ * The probe drives the clock itself rather than relying on the browser's
+ * animation frames: a tab the user cannot see has its frames frozen, and its
+ * setTimeout is clamped to a second, so a wall-clock budget starves the game
+ * clock and every in-game timer looks like a hang. Every budget in this file
+ * is therefore counted in frames of game time, never in milliseconds.
+ *
+ * Each frame ends on a task yield, so anything the game awaited in a task —
+ * its boot, an asset load, the elevator's tween — gets a chance to finish.
+ * @param {number} n frames to advance
+ */
+async function frames(n) {
+  for (let i = 0; i < n; i++) {
+    keepPlaying();
+    window.__evTick?.(1);
+    gameTime++;
+    await yieldToTask();
+  }
+  // let any awaited continuation inside the game finish
+  for (let i = 0; i < 4; i++) await Promise.resolve();
+}
+
+const KEYS = { KeyA: 'a', KeyD: 'd', KeyE: 'e', KeyQ: 'q', KeyW: 'w', KeyS: 's', Space: ' ' };
+
+function keyDown(code) {
+  window.dispatchEvent(new KeyboardEvent('keydown', { code, key: KEYS[code] ?? '', bubbles: true, cancelable: true }));
+}
+function keyUp(code) {
+  window.dispatchEvent(new KeyboardEvent('keyup', { code, key: KEYS[code] ?? '', bubbles: true, cancelable: true }));
+}
+async function tap(code, hold = 3) {
+  keyDown(code);
+  await frames(hold);
+  keyUp(code);
+  await frames(2);
+}
+
+/** Keys the probe is currently holding down. */
+const held = new Set();
+function hold(code) {
+  held.add(code);
+  // Re-assert the key every time. The game clears its held keys when a
+  // panel takes the keyboard, and a pause (the window lost focus) would
+  // otherwise drop the key and leave the player standing still.
+  keyDown(code);
+}
+function release(code) {
+  if (!held.has(code)) return;
+  held.delete(code);
+  keyUp(code);
+}
+function releaseAll() { [...held].forEach(release); }
+
+/** Move the pointer to a canvas pixel position. */
+function pointAt(cx, cy) {
+  const r = canvas.getBoundingClientRect();
+  window.dispatchEvent(new MouseEvent('mousemove', {
+    clientX: r.left + (cx / canvas.width) * r.width,
+    clientY: r.top + (cy / canvas.height) * r.height,
+    bubbles: true,
+  }));
+}
+function mouseDown() {
+  canvas.dispatchEvent(new MouseEvent('mousedown', { button: 0, bubbles: true, cancelable: true }));
+}
+function mouseUp() {
+  window.dispatchEvent(new MouseEvent('mouseup', { button: 0, bubbles: true, cancelable: true }));
+}
+
+/* ------------------------------------------------------------------ *
+ * Walking
+ * ------------------------------------------------------------------ */
+
+/**
+ * Can the player stand in this cell?
+ *
+ * The player is 1.7 tiles tall, so a cell is only walkable if it and the cell
+ * above it are both open. A path that ignores that leads the player into a
+ * slot they cannot fit in, and the walk just stalls.
+ * @param {number} x
+ * @param {number} y
+ * @returns {boolean}
+ */
+function openCell(x, y) {
+  const w = state.world;
+  if (x < 0 || y < 0 || x >= WW || y >= w.h) return false;
+  if (w.g[y * WW + x] !== 0) return false;
+  return y === 0 || w.g[(y - 1) * WW + x] === 0;
+}
+
+/**
+ * Is there ground under this cell?
+ *
+ * A cell without one is a hole. The player falls into it, and since the player
+ * cannot dig upward, a fall is one-way. The probe never walks over a hole.
+ * @param {number} x
+ * @param {number} y
+ * @returns {boolean}
+ */
+function floorCell(x, y) {
+  const w = state.world;
+  return y + 1 >= w.h || w.g[(y + 1) * WW + x] !== 0;
+}
+
+/**
+ * Can the player get to this cell and stay there?
+ *
+ * A cell with no floor is a hole. The player falls into it — and since the
+ * player cannot dig upward, a fall is one-way. A single row drop is fine:
+ * the player lands on the next row down and carries on. Anything deeper is
+ * a shaft, and the probe never walks into one.
+ * @param {number} x
+ * @param {number} y
+ * @returns {boolean}
+ */
+function safeCell(x, y) {
+  if (!openCell(x, y)) return false;
+  return floorCell(x, y) || floorCell(x, y + 1);
+}
+
+/**
+ * A path the player can actually walk.
+ *
+ * The game's own pathfinder lets a route through a one-tile gap in the rock,
+ * because the monster can squeeze through it. A player cannot, so the probe
+ * walks its own path over cells it can stand in.
+ * @param {number} sx start tile x
+ * @param {number} sy start tile y
+ * @param {number} gx goal tile x
+ * @param {number} gy goal tile y
+ * @returns {number[]|null} tile indices from start (exclusive) to goal
+ */
+function playerPath(sx, sy, gx, gy) {
+  if (!safeCell(sx, sy) || !safeCell(gx, gy)) return null;
+
+  const n = WW * state.world.h;
+  const cost = new Int32Array(n).fill(0x7fffffff);
+  const prev = new Int32Array(n).fill(-1);
+  const start = sy * WW + sx;
+  const goal = gy * WW + gx;
+  cost[start] = 0;
+  // Bucket queue: every step has a small integer cost.
+  const buckets = [];
+  buckets[0] = [start];
+  for (let c = 0; c < buckets.length; c++) {
+    const bucket = buckets[c];
+    if (!bucket) continue;
+    for (let k = 0; k < bucket.length; k++) {
+      const cur = bucket[k];
+      if (cost[cur] !== c) continue;
+      if (cur === goal) {
+        const path = [];
+        let walk = goal;
+        while (walk !== start && walk !== -1) {
+          path.push(walk);
+          walk = prev[walk];
+        }
+        path.reverse();
+        return path;
+      }
+      const x = cur % WW;
+      const y = (cur / WW) | 0;
+      for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        const nx = x + dx;
+        const ny = y + dy;
+        if (!safeCell(nx, ny)) continue;
+        const ni = ny * WW + nx;
+        let step = 1;
+        if (dy < 0) step = 3;
+        else if (dy > 0) step = 4;
+        const nc = c + step;
+        if (nc < cost[ni]) {
+          cost[ni] = nc;
+          prev[ni] = cur;
+          (buckets[nc] = buckets[nc] || []).push(ni);
+        }
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Reject a path that crosses rock or a hole.
+ *
+ * The game's pathfinder is happy to route through a one-tile gap, because
+ * the monster can squeeze through it. A player cannot, and a player who walks
+ * over a shaft does not come back.
+ * @param {number[]|null} cells
+ * @returns {number[]|null}
+ */
+function safePath(cells) {
+  if (!cells || !cells.length) return null;
+  for (const c of cells) {
+    const x = c % WW;
+    const y = (c / WW) | 0;
+    if (!safeCell(x, y)) return null;
+  }
+  return cells;
+}
+
+/** Veins the probe has already tried and could not reach. */
+const failedGoals = new Set();
+
+/** The direction the probe is tunnelling in. Sticky, so it does not dither. */
+let tunnelDir = 1;
+
+/**
+ * Walk the player to a world tile using the game's own pathfinder.
+ * @param {number} gx target tile x
+ * @param {number} gy target tile y
+ * @param {number} budgetSec seconds of game time to try before giving up
+ * @returns {Promise<boolean>} true if the player got there
+ */
+walkTo.warned = new Set();
+
+async function walkTo(gx, gy, budgetSec = 15) {
+  const w = state.world;
+  const p = state.player;  const plan = () =>
+    playerPath(Math.floor(p.x), Math.floor(p.y), gx, gy) ||
+    safePath(findPath(w.g, w.dg, WW, w.h, Math.floor(p.x), Math.floor(p.y), gx, gy, false));
+  let path = plan() || [];
+  if (!path.length) {
+    if (Math.floor(p.x) === gx && Math.floor(p.y) === gy) return true;
+    if (!walkTo.warned.has(gx + ',' + gy)) {
+      walkTo.warned.add(gx + ',' + gy);
+      dim('no path to ' + gx + ',' + gy);
+    }
+    return false;
+  }
+  const until = gameTime + sec(budgetSec);
+  let i = 0;
+  let lastX = p.x;
+  let lastY = p.y;
+  let stuck = 0;
+  let jumps = 0;
+  let from = Math.floor(p.y) * WW + Math.floor(p.x);
+  while (i < path.length && gameTime < until) {
+    // If the player has left the path — fell into a shaft, slid down a slope
+    // — plan again from wherever they ended up rather than walking on.
+    const here = Math.floor(p.y) * WW + Math.floor(p.x);
+    if (here !== from && here !== path[i] && here !== path[i - 1]) {
+      const again = plan() || [];
+      if (!again.length) {
+        dim('lost the way to ' + gx + ',' + gy + ' at ' + p.x.toFixed(1) + ',' + p.y.toFixed(1));
+        releaseAll();
+        return false;
+      }
+      path = again;
+      i = 0;
+      from = here;
+      lastX = p.x;
+      lastY = p.y;
+      stuck = 0;
+      jumps = 0;
+      continue;
+    }
+    const cell = path[i];
+    const cx = (cell % WW) + 0.5;
+    const cy = ((cell / WW) | 0) + 0.5;
+    const dx = cx - p.x;
+    const dy = cy - p.y;
+    if (Math.abs(dx) < 0.45 && Math.abs(dy) < 0.85) {
+      releaseAll();
+      i++;
+      continue;
+    }
+    if (dy < -0.45 && (p.gr ?? 0) > 0) {
+      // step up: jump, and hold a direction so the arc carries us over
+      hold(dx > 0 ? 'KeyD' : 'KeyA');
+      await tap('Space', 2);
+    } else {
+      hold(dx > 0 ? 'KeyD' : 'KeyA');
+      release(dx > 0 ? 'KeyA' : 'KeyD');
+      await frames(1);
+    }
+    if (Math.abs(p.x - lastX) < 0.005 && Math.abs(p.y - lastY) < 0.005) {
+      stuck++;
+      if (stuck > 20 && jumps < 3) {
+        // A ledge, most likely. Try to hop it before assuming it is rock.
+        jumps++;
+        dim('hopping a ledge at ' + p.x.toFixed(1) + ',' + p.y.toFixed(1));
+        hold(dx > 0 ? 'KeyD' : 'KeyA');
+        await tap('Space', 3);
+        stuck = 0;
+        lastX = p.x;
+        lastY = p.y;
+        continue;
+      }
+      if (stuck > 60) {
+        // The path runs through rock. Dig through it, the way a player
+        // would, rather than giving up.
+        const cell = path[i];
+        const block = solidNeighbourTowards(cell % WW, (cell / WW) | 0);
+        if (block) {
+          dim('digging through rock at ' + block.ox + ',' + block.oy);
+          releaseAll();
+          await mineCell(block.ox, block.oy, 8);
+          stuck = 0;
+          lastX = p.x;
+          lastY = p.y;
+          continue;
+        }
+        releaseAll();
+        dim('stuck while walking to ' + gx + ',' + gy +
+            ' (at ' + p.x.toFixed(1) + ',' + p.y.toFixed(1) + ', next cell ' +
+            (path[i] % WW) + ',' + ((path[i] / WW) | 0) + ')');
+        return false;
+      }
+    } else {
+      stuck = 0;
+    }
+    lastX = p.x;
+    lastY = p.y;
+  }
+  releaseAll();
+  return i >= path.length;
+}
+
+/**
+ * The solid cell between the player and a target tile, if there is one.
+ * @param {number} tx
+ * @param {number} ty
+ * @returns {Object|null}
+ */
+function solidNeighbourTowards(tx, ty) {
+  const w = state.world;
+  const p = state.player;
+  const dx = Math.sign(tx - p.x);
+  const dy = Math.sign(ty - p.y);
+  const options = [[dx, 0], [0, dy], [dx, dy], [-dx, 0], [0, -dy]];
+  for (const [ox, oy] of options) {
+    if (!ox && !oy) continue;
+    const x = Math.floor(p.x) + ox;
+    const y = Math.floor(p.y) + oy;
+    if (x < 1 || y < 1 || x >= WW - 1 || y >= w.h - 1) continue;
+    const v = w.g[y * WW + x];
+    if (v >= 1 && v <= 3) return { ox: x, oy: y };
+  }
+  return null;
+}
+
+/* ------------------------------------------------------------------ *
+ * Mining
+ * ------------------------------------------------------------------ */
+
+/** Solid cells the player could mine from where they stand. */
+function mineableInReach() {
+  const w = state.world;
+  const p = state.player;
+  const out = [];
+  // The game's own limits: reach is 3.3 tiles, and you cannot aim above your
+  // own head.
+  const minRow = Math.floor(p.y - 0.85);
+  const feetRow = Math.floor(p.y);
+  for (let y = Math.floor(p.y - 3); y <= Math.floor(p.y + 3); y++) {
+    for (let x = Math.floor(p.x - 3); x <= Math.floor(p.x + 3); x++) {
+      if (x < 1 || y < 1 || x >= WW - 1 || y >= w.h - 1) continue;
+      const v = w.g[y * WW + x];
+      if (v < 1 || v > 3) continue;
+      if (Math.hypot(x + 0.5 - p.x, y + 0.5 - p.y) > 3.25) continue;
+      if (y < minRow) continue;
+      // Digging out the block the player is standing on drops the player into
+      // the hole. That is only safe when there is ground one row further
+      // down; a block over a shaft is a one-way fall.
+      if (Math.abs(x + 0.5 - p.x) < 0.6 && y >= feetRow && !floorCell(x, y + 1)) continue;
+      out.push({ ox: x, oy: y, kind: w.o[y * WW + x] ? ORE_IDS[w.o[y * WW + x] - 1] : null });
+    }
+  }
+  return out;
+}
+
+/** Open cells near the player, nearest first — somewhere to walk to. */
+function nearbyOpen() {
+  const w = state.world;
+  const p = state.player;
+  const out = [];
+  for (let y = Math.floor(p.y - 6); y <= Math.floor(p.y + 4); y++) {
+    for (let x = Math.floor(p.x - 8); x <= Math.floor(p.x + 8); x++) {
+      if (x < 1 || y < 1 || x >= WW - 1 || y >= w.h - 1) continue;
+      if (w.g[y * WW + x]) continue;
+      out.push({ ox: x, oy: y, d: Math.hypot(x + 0.5 - p.x, y + 0.5 - p.y) });
+    }
+  }
+  return out.sort((a, b) => a.d - b.d);
+}
+
+/** Open cells near the player that have a solid block next to them. */
+function wallFaces() {
+  const w = state.world;
+  const p = state.player;
+  const out = [];
+  for (let y = Math.floor(p.y - 8); y <= Math.floor(p.y + 4); y++) {
+    for (let x = Math.floor(p.x - 10); x <= Math.floor(p.x + 10); x++) {
+      if (x < 1 || y < 1 || x >= WW - 1 || y >= w.h - 1) continue;
+      if (w.g[y * WW + x]) continue;
+      for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        const nx = x + dx;
+        const ny = y + dy;
+        const v = w.g[ny * WW + nx];
+        if (v >= 1 && v <= 3) {
+          out.push({
+            ox: x, oy: y, wx: nx, wy: ny,
+            kind: w.o[ny * WW + nx] ? ORE_IDS[w.o[ny * WW + nx] - 1] : null,
+            d: Math.hypot(x + 0.5 - p.x, y + 0.5 - p.y),
+          });
+          break;
+        }
+      }
+    }
+  }
+  return out.sort((a, b) => a.d - b.d);
+}
+
+/**
+ * How far the player would fall if a block were dug out from here.
+ *
+ * The player cannot dig upward, so a fall is one-way. A short drop is fine —
+ * the player lands and carries on. A long one is a shaft, and the probe does
+ * not dig into one.
+ * @param {number} x
+ * @param {number} y the row the block would be dug from
+ * @returns {number} rows the player would drop
+ */
+function dropDepth(x, y) {
+  const w = state.world;
+  for (let d = 1; d <= 12; d++) {
+    const row = y + d;
+    if (row >= w.h) return d;
+    if (w.g[row * WW + x] !== 0) return d;
+  }
+  return 12;
+}
+
+/**
+ * The cost of digging to every cell of the cave from one point.
+ *
+ * Open cells are free to walk through; rock costs a dig. A 0-1 breadth-first
+ * search over the cave finds the cheapest way in to every cell, which is not
+ * always the straight line — sometimes the way to a vein is round the side,
+ * and sometimes a vein that looks far is a single block away through a wall.
+ * @param {number} fromX
+ * @param {number} fromY
+ * @returns {{dist: Int32Array, prev: Int32Array}}
+ */
+function digField(fromX, fromY) {
+  const w = state.world;
+  const n = WW * w.h;
+  const dist = new Int32Array(n).fill(0x7fffffff);
+  const prev = new Int32Array(n).fill(-1);
+  const start = fromY * WW + fromX;
+  dist[start] = 0;
+  // Dijkstra with buckets. Walking one tile costs WALK, digging one block
+  // costs DIG — three walks, because a dig is slower than a step and it is
+  // loud. Open cells the player cannot stand in (holes) are not routes at
+  // all: walking into one is a fall.
+  const buckets = [[start]];
+  for (let c = 0; c < buckets.length; c++) {
+    const bucket = buckets[c];
+    if (!bucket) continue;
+    for (let k = 0; k < bucket.length; k++) {
+      const cur = bucket[k];
+      if (dist[cur] !== c) continue;
+      const x = cur % WW;
+      const y = (cur / WW) | 0;
+      for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        const nx = x + dx;
+        const ny = y + dy;
+        if (nx < 1 || ny < 1 || nx >= WW - 1 || ny >= w.h) continue;
+        // No going up: the player cannot dig upward, so a route that climbs
+        // is a route the player cannot mine.
+        if (ny < y) continue;
+        const ni = ny * WW + nx;
+        const v = w.g[ni];
+        if (v >= 4) continue;
+        let cost;
+        if (v === 0) {
+          if (!safeCell(nx, ny)) continue;
+          cost = WALK;
+        } else {
+          cost = DIG;
+        }
+        const nc = c + cost;
+        if (nc < dist[ni]) {
+          dist[ni] = nc;
+          prev[ni] = cur;
+          (buckets[nc] = buckets[nc] || []).push(ni);
+        }
+      }
+    }
+  }
+  return { dist, prev };
+}
+
+/** The cost of walking one tile, in the dig field's units. */
+const WALK = 2;
+/** The cost of digging one block, in the dig field's units. */
+const DIG = 6;
+
+/**
+ * The route of cells to dig through to reach a cell, from a cost field.
+ * @param {{dist: Int32Array, prev: Int32Array}} field
+ * @param {number} toX
+ * @param {number} toY
+ * @returns {number[]|null} tile indices from start (exclusive) to goal
+ */
+function digRouteFrom(field, toX, toY) {
+  const goal = toY * WW + toX;
+  if (field.dist[goal] === 0x7fffffff) return null;
+  const route = [];
+  let cur = goal;
+  while (cur !== -1 && field.prev[cur] !== -1) {
+    route.push(cur);
+    cur = field.prev[cur];
+  }
+  route.reverse();
+  return route;
+}
+
+/**
+ * Dig a route to a cell, one block at a time, the way a player works.
+ * @param {number[]} route the cells to dig through, in order
+ * @returns {Promise<boolean>} true if the route was dug
+ */
+async function digRoute(route) {
+  // One block at a time. Digging changes the cave — the player may fall into
+  // the hole, and the route from where they were is no longer the route from
+  // where they are — so the plan is made afresh after every block.
+  for (const cell of route) {
+    const x = cell % WW;
+    const y = (cell / WW) | 0;
+    const v = state.world.g[cell];
+    if (v >= 1 && v <= 3) {
+      const d = Math.hypot(x + 0.5 - state.player.x, y + 0.5 - state.player.y);
+      if (d <= 3.1) {
+        await mineCell(x, y, 12);
+        return true;
+      }
+    }
+    // Stepping into the hole is best effort: the tunnel is what matters.
+    if (safeCell(x, y)) await walkTo(x, y, 1.5);
+  }
+  return true;
+}
+
+/**
+ * Tunnel one step towards a target.
+ *
+ * This is how a player actually moves through rock: pick a direction, dig the
+ * block in the way, step into the hole, repeat. Digging whatever happens to
+ * be nearest hollows out a pocket instead of a tunnel, and a pocket with no
+ * way out is a dead end.
+ * @param {Object} goal the cell to tunnel towards
+ * @returns {Promise<boolean>} true if the player made progress
+ */
+async function tunnelTowards(goal) {
+  const w = state.world;
+  const p = state.player;
+  const level = Math.floor(p.y);
+  const cell = Math.floor(p.x);
+  const headRow = Math.floor(p.y - 0.85);
+  const dx = goal.ox - cell;
+
+  // Ore below and roughly in the same column: go straight down. A shaft is
+  // how a miner descends, and unlike a diagonal drift it does not walk away
+  // from the vein it is aiming at.
+  if (goal.oy > level + 1 && Math.abs(dx) <= 1) {
+    const sy = level + 1;
+    if (cell >= 1 && sy >= 1 && cell < WW - 1 && sy < w.h) {
+      const v = w.g[sy * WW + cell];
+      // the drop has to land somewhere: a short fall is fine, a shaft is not
+      if (v >= 1 && v <= 3 && dropDepth(cell, sy) <= 3) {
+        await mineCell(cell, sy, 10);
+        return true;
+      }
+    }
+  }
+
+  // Otherwise drift sideways. The direction is sticky, and only flips when
+  // the ore is clearly on the other side: flipping every step would walk the
+  // player back and forth over the same block.
+  if (dx >= 2) tunnelDir = 1;
+  else if (dx <= -2) tunnelDir = -1;
+  const dir = tunnelDir;
+  const aheadX = cell + dir;
+  if (aheadX < 1 || aheadX >= WW - 1) return false;
+  for (const y of [level, level + 1, level - 1]) {
+    if (y < headRow || y < 1 || y >= w.h) continue;
+    const v = w.g[y * WW + aheadX];
+    if (v < 1 || v > 3) continue;
+    if (Math.hypot(aheadX + 0.5 - p.x, y + 0.5 - p.y) > 3.2) continue;
+    if (dropDepth(aheadX, y) > 3) continue;
+    await mineCell(aheadX, y, 10);
+    if (dropDepth(aheadX, y) <= 1) await walkTo(aheadX, y, 1.5);
+    return true;
+  }
+  // The way ahead is already open: walk into it.
+  for (const y of [level, level + 1, level - 1]) {
+    if (safeCell(aheadX, y)) {
+      await walkTo(aheadX, y, 1.5);
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * The solid cell to dig next, on the way towards a target.
+ *
+ * Digging is how a player reaches ore that is out of reach: tunnel towards it
+ * one block at a time. The block has to be inside the pickaxe's reach and have
+ * open space beside it — otherwise the player digs a hole they cannot climb
+ * into, which is how the probe used to dig itself into a corner and give up.
+ * Returns null when there is nothing solid to dig.
+ * @param {number} tx
+ * @param {number} ty
+ * @returns {Object|null}
+ */
+function digToward(tx, ty) {
+  const w = state.world;
+  const p = state.player;
+  const cands = [];
+  const R = 3;
+  const headRow = Math.floor(p.y - 0.85);
+  const level = Math.floor(p.y);
+  // The player's own row, the row above it and the floor they stand on. The
+  // floor row is how the probe digs a staircase down to ore that is below it.
+  for (let y = level - 1; y <= level + 1; y++) {
+    for (let x = Math.floor(p.x) - R; x <= Math.floor(p.x) + R; x++) {
+      if (x < 1 || y < 1 || x >= WW - 1 || y >= w.h - 1) continue;
+      const v = w.g[y * WW + x];
+      if (v < 1 || v > 3) continue;
+      if (y < headRow) continue;
+      if (Math.hypot(x + 0.5 - p.x, y + 0.5 - p.y) > 3.2) continue;
+      // do not dig out the player's own footing
+      if (Math.abs(x + 0.5 - p.x) < 0.6 && y >= level) continue;
+      // A block with ground under it makes a tunnel the player can walk into;
+      // one without is a hole, which is a last resort.
+      const d = Math.hypot(x + 0.5 - (tx + 0.5), y + 0.5 - (ty + 0.5)) + (floorCell(x, y) ? 0 : 3);
+      cands.push({ ox: x, oy: y, d, floor: floorCell(x, y) });
+    }
+  }
+  cands.sort((a, b) => a.d - b.d);
+  return cands[0] || null;
+}
+
+/** Every cell holding the given ore, with an open cell to stand in if there is one. */
+function oreCells(kind) {
+  const w = state.world;
+  const out = [];
+  for (let y = 1; y < w.h - 1; y++) {
+    for (let x = 1; x < WW - 1; x++) {
+      const i = y * WW + x;
+      if (!w.o[i]) continue;
+      if (kind && ORE_IDS[w.o[i] - 1] !== kind) continue;
+      let open = null;
+      for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        const nx = x + dx;
+        const ny = y + dy;
+        if (nx < 1 || ny < 1 || nx >= WW - 1 || ny >= w.h - 1) continue;
+        if (w.g[ny * WW + nx]) continue;
+        open = { sx: nx, sy: ny };
+        break;
+      }
+      out.push({ ox: x, oy: y, kind: ORE_IDS[w.o[i] - 1], open });
+    }
+  }
+  return out;
+}
+
+/** Distance between two cells. Either may be the player. */
+function distTo(cell, other) {
+  const cx = cell.ox + 0.5;
+  const cy = cell.oy + 0.5;
+  const ox = (other.ox ?? other.x) + 0.5;
+  const oy = (other.oy ?? other.y) + 0.5;
+  return Math.hypot(cx - ox, cy - oy);
+}
+
+/**
+ * Aim the pointer at a world cell and hold the mouse down until the block
+ * breaks or the pack changes.
+ * @param {number} tx
+ * @param {number} ty
+ * @param {number} budgetSec seconds of game time to keep trying
+ * @returns {Promise<boolean>} true if the pack gained something
+ */
+async function mineCell(tx, ty, budgetSec = 20) {
+  const before = JSON.stringify(state.inventory.ores);
+  const until = gameTime + sec(budgetSec);
+  let down = false;
+  let mx = null;
+  let my = null;
+  let aimed = false;
+  // The pickaxe has a reach and the game will not let the player aim above
+  // its own head. A block out of reach is not a block to swing at. The
+  // limits here match the ones mineableInReach uses, so a block it offers is
+  // a block that can be swung at.
+  const p0 = state.player;
+  if (Math.hypot(tx + 0.5 - p0.x, ty + 0.5 - p0.y) > 3.25) return false;
+  if (ty < Math.floor(p0.y - 0.85)) return false;
+  while (gameTime < until) {
+    const p = state.player;
+    const cam = state.ui.camera;
+    const sens = state.meta.settings?.sens ?? 1;
+    const sx = (p.x - cam.x) * T;
+    const sy = (p.y - cam.y) * T;
+    const ax = (tx + 0.5 - cam.x) * T;
+    const ay = (ty + 0.5 - cam.y) * T;
+    if (mx === null) {
+      mx = sx + (ax - sx) / sens;
+      my = sy + (ay - sy) / sens;
+    }
+    pointAt(mx, my);
+    if (!down) {
+      mouseDown();
+      down = true;
+    }
+    // One frame, so the game reads the pointer we just moved and recomputes
+    // what it is aiming at. The aim is only meaningful after that frame —
+    // reading it before is reading the previous pointer's aim.
+    await frames(1);
+    if (aim.x !== tx || aim.y !== ty) {
+      // The game is aiming at another tile. Steer the pointer by the
+      // difference: one tile of pointer movement is one tile of aim.
+      mx += ((tx - aim.x) * T) / sens;
+      my += ((ty - aim.y) * T) / sens;
+      mx = Math.max(0, Math.min(canvas.width, mx));
+      my = Math.max(0, Math.min(canvas.height, my));
+      if (!aimed) {
+        aimed = true;
+        dim('aim ' + aim.x + ',' + aim.y + ' instead of ' + tx + ',' + ty + ' — steering');
+      }
+    }
+    if (JSON.stringify(state.inventory.ores) !== before) {
+      mouseUp();
+      return true;
+    }
+    if (!state.world.g[ty * WW + tx]) {
+      // the block broke but held nothing
+      mouseUp();
+      return false;
+    }
+  }
+  mouseUp();
+  return false;
+}
+
+/* ------------------------------------------------------------------ *
+ * The expedition
+ * ------------------------------------------------------------------ */
+
+/** Walk to the elevator and ride down. */
+async function descend() {
+  const until = gameTime + sec(6);
+  while (state.player.x > 7.2 && gameTime < until) {
+    hold('KeyA');
+    release('KeyD');
+    await frames(2);
+  }
+  releaseAll();
+  await frames(4);
+  await tap('KeyE', 3);
+  await frames(10);
+  const riding = gameTime + sec(40);
+  while (state.ui.riding && gameTime < riding) await frames(10);
+  await frames(30);
+  return state.player.y > SF + 2;
+}
+
+/** Walk back to the pad and ride up. */
+async function ascend() {
+  const pad = state.world.pad;
+  const home = await walkTo(Math.floor(pad.x), pad.f - 1, 20);
+  dim('walked back to the pad: ' + home + ' at ' + state.player.x.toFixed(1) + ',' + state.player.y.toFixed(1));
+  await tap('KeyE', 3);
+  await frames(10);
+  const riding = gameTime + sec(40);
+  while (state.ui.riding && gameTime < riding) await frames(10);
+  await frames(30);
+  return state.player.y < SF + 1;
+}
+
+/** The ore the quest still needs most. */
+function neededOre() {
+  const task = currentTask();
+  const short = ORE_IDS.filter((k) => task.r[k]).map((k) => ({
+    k,
+    missing: (task.r[k] || 0) - (state.inventory.ores[k] || 0),
+  }));
+  short.sort((a, b) => b.missing - a.missing);
+  return short.length ? short[0].k : null;
+}
+
+async function run() {
+  logEl.className = '';
+  logText = '';
+  verdictEl.className = 'run';
+  verdictEl.textContent = 'running…';
+  errors.length = 0;
+  checks.length = 0;
+
+  log('Signing in a probe account and booting the game…');
+
+  const accounts = await import('../src/services/accounts.js');
+  const signed = await accounts.signup('probe', 'probe123');
+  if (!signed.ok) await accounts.login('probe', 'probe123');
+  // Start from nothing, so every run of the probe is the same expedition.
+  await accounts.eraseSaves();
+  // Take over the clock: the browser's animation frames are unreliable in a
+  // tab nobody is looking at.
+  window.__evDrive = true;
+  await import('../src/main.js');
+
+  let ticked = 0;
+  while (!document.getElementById('btnStart') && ticked < sec(15)) {
+    await frames(4);
+    ticked += 4;
+  }
+  check('game boots to the title screen', !!document.getElementById('btnStart'), 'screen=' + state.ui.screen);
+
+  // --- menus -------------------------------------------------------------
+  document.getElementById('btnStart')?.click();
+  ticked = 0;
+  while (!document.querySelector('.diff[data-d="normal"]') && ticked < sec(10)) {
+    await frames(4);
+    ticked += 4;
+  }
+  const diff = document.querySelector('.diff[data-d="normal"]');
+  check('difficulty menu appears', !!diff);
+  // Make the intro play, so the probe always has a dialogue to dismiss.
+  state.meta.seenIntro = false;
+  diff?.click();
+
+  ticked = 0;
+  while (!state.ui.dialogue && ticked < sec(15)) {
+    await frames(4);
+    ticked += 4;
+  }
+  check('the run starts and the intro dialogue plays', !!state.ui.dialogue, 'screen=' + state.ui.screen);
+
+  // --- intro dialogue ----------------------------------------------------
+  await tap('Escape', 3);
+  await frames(8);
+  await tap('Escape', 3);
+  await frames(8);
+  check('the dialogue can be dismissed', !state.ui.dialogue);
+
+  // --- descend -----------------------------------------------------------
+  const p0 = state.player.x;
+  const walkUntil = gameTime + sec(6);
+  while (state.player.x > 7.2 && gameTime < walkUntil) {
+    hold('KeyA');
+    release('KeyD');
+    await frames(2);
+  }
+  releaseAll();
+  await frames(4);
+  check('the player walks left', state.player.x < p0 - 0.5,
+    'x ' + p0.toFixed(2) + ' -> ' + state.player.x.toFixed(2) +
+    ' paused=' + state.ui.paused + ' modal=' + state.ui.modal + ' dlg=' + !!state.ui.dialogue);
+
+  let deep = await descend();
+  if (!deep) {
+    // The elevator is animated on animation frames, so a stalled tab can
+    // leave it half way. Try once more before calling it a failure.
+    dim('the elevator stalled, trying again');
+    deep = await descend();
+  }
+  check('the elevator carries the player underground', deep, 'y=' + state.player.y.toFixed(2));
+  check('the monster starts asleep (grace period)', state.world.sl?.s === 1, 'sl=' + JSON.stringify(state.world.sl));
+  // Checked here, while the monster is still asleep: the descent is loud, and
+  // the grace period is exactly what is supposed to swallow that noise.
+  check('the sleeping monster heard nothing', Object.keys(state.memory.snd).length === 0,
+    'sounds remembered: ' + Object.keys(state.memory.snd).length);
+  dim('player landed at ' + state.player.x.toFixed(1) + ',' + state.player.y.toFixed(1) +
+      '  biome=' + (state.ui.lastBiome || '?'));
+
+  // --- mine the quota ----------------------------------------------------
+  const task = currentTask();
+  dim('quota: ' + ORE_IDS.filter((k) => task.r[k]).map((k) => k + ' ' + task.r[k]).join(', '));
+  const mineUntil = gameTime + sec(300);
+  let mined = 0;
+  let dug = 0;
+  let guard = 0;
+  let diggingSideways = false;
+  let lastStamp = '';
+  while (!canDeliver() && gameTime < mineUntil && guard++ < 240) {
+    if (state.ui.screen === 'death') {
+      dim('the player was killed while mining');
+      break;
+    }
+    const kind = neededOre();
+    if (!kind) break;
+    let target = mineableInReach().filter((c) => c.kind === kind)[0];
+    // Log the state when it changes, not every frame of it.
+    const stamp = kind + '|' + state.player.x.toFixed(1) + ',' + state.player.y.toFixed(1) +
+      '|' + JSON.stringify(state.inventory.ores);
+    if (stamp !== lastStamp) {
+      lastStamp = stamp;
+      dim('need ' + kind + '  at ' + state.player.x.toFixed(1) + ',' + state.player.y.toFixed(1) +
+        '  in reach: ' + mineableInReach().length + '  pack: ' + JSON.stringify(state.inventory.ores));
+    }
+
+    // (b) the ore we need is somewhere else. Dig a route to it, the way a
+    // player would: block by block, through the rock.
+    if (!target) {
+      const cells = oreCells(kind);
+      if (!cells.length) {
+        dim('no ' + kind + ' left in the world');
+        break;
+      }
+      // Cheapest to dig, not closest in a straight line: a vein two tiles
+      // away through a wall is quicker than one ten tiles away down a
+      // gallery.
+      const field = digField(Math.floor(state.player.x), Math.floor(state.player.y));
+      let best = null;
+      for (const c of cells) {
+        if (failedGoals.has(c.ox + ',' + c.oy)) continue;
+        const cost = field.dist[c.oy * WW + c.ox];
+        if (cost === 0x7fffffff) continue;
+        if (!best || cost < best.cost) {
+          const route = digRouteFrom(field, c.ox, c.oy) || [];
+          const digs = route.filter((cell) => state.world.g[cell] !== 0).length;
+          best = { ox: c.ox, oy: c.oy, cost, digs, route };
+        }
+      }
+      if (!best) {
+        dim('no way through to the ' + kind);
+        break;
+      }
+      const before = JSON.stringify(state.inventory.ores);
+      dim('digging ' + best.digs + ' blocks to the ' + kind + ' at ' + best.ox + ',' + best.oy);
+      await digRoute(best.route);
+      // A vein the probe cannot reach is not worth trying again: it would
+      // spend the whole expedition walking at a wall.
+      if (JSON.stringify(state.inventory.ores) === before) failedGoals.add(best.ox + ',' + best.oy);
+      dug++;
+      continue;
+    }
+    const ok = await mineCell(target.ox, target.oy, 20);
+    if (ok) {
+      mined++;
+      dim('mined ' + target.kind + '  (pack: ' + JSON.stringify(state.inventory.ores) + ')');
+    }
+    // A hole dug to the side has to be walked into before the next one can
+    // be dug; a hole dug downwards drops the player in on its own. A hole
+    // with no ground under it is not walked into at all — that is a fall.
+    if (diggingSideways && floorCell(target.ox, target.oy)) {
+      await walkTo(target.ox, target.oy, 2.5);
+    }
+    diggingSideways = false;
+  }
+  check('the quota is mined', canDeliver(), 'pack=' + JSON.stringify(state.inventory.ores));
+  check('ore reached the pack', mined > 0, mined + ' blocks mined, ' + dug + ' dug');
+  check('mining earned coins', state.campaign.coins > 0, 'coins=' + state.campaign.coins);
+
+  // --- come home ---------------------------------------------------------
+  check('the elevator brings the player home', await ascend(), 'y=' + state.player.y.toFixed(2));
+
+  // --- deliver -----------------------------------------------------------
+  const money0 = state.campaign.money;
+  const quest0 = state.campaign.q;
+  await tap('KeyE', 3);
+  await frames(10);
+  await tap('Escape', 3);
+  await frames(10);
+  check('the ore is delivered for money', state.campaign.money > money0,
+    '$' + money0 + ' -> $' + state.campaign.money);
+  check('the quest advances', state.campaign.q > quest0, 'quest ' + quest0 + ' -> ' + state.campaign.q);
+
+  // --- the monster wakes and hunts --------------------------------------
+  check('the player can descend again', await descend(), 'y=' + state.player.y.toFixed(2));
+  const seen = [];
+  const wakeUntil = gameTime + sec(120);
+  while (gameTime < wakeUntil) {
+    const s = state.monster.s;
+    if (seen[seen.length - 1] !== s) seen.push(s);
+    if (state.world.sl && state.world.sl.s !== 1) break;
+    // keep making noise so the monster has something to hear
+    hold('KeyA');
+    await frames(8);
+    release('KeyA');
+    hold('KeyD');
+    await frames(8);
+    release('KeyD');
+  }
+  check('the monster wakes up', !!state.world.sl && state.world.sl.s !== 1, 'sl=' + JSON.stringify(state.world.sl));
+
+  const huntUntil = gameTime + sec(60);
+  while (gameTime < huntUntil) {
+    const s = state.monster.s;
+    if (seen[seen.length - 1] !== s) seen.push(s);
+    if (s === 'inv' || s === 'chase') break;
+    hold('KeyA');
+    await frames(10);
+    release('KeyA');
+    hold('KeyD');
+    await frames(10);
+    release('KeyD');
+  }
+  const heard = Object.keys(state.memory.snd).length;
+  check('the monster hunts the player', state.monster.s === 'inv' || state.monster.s === 'chase' || heard > 0,
+    'states seen: ' + seen.join(' -> ') + ', sounds remembered: ' + heard);
+
+  // --- verdict -----------------------------------------------------------
+  check('no runtime errors', errors.length === 0, errors.slice(0, 3).join(' | '));
+  // Hand the clock back, so the game can be played by hand afterwards.
+  window.__evDrive = false;
+  const failed = checks.filter((c) => !c.ok);
+  verdictEl.className = failed.length ? 'fail' : 'pass';
+  verdictEl.textContent = failed.length
+    ? failed.length + ' of ' + checks.length + ' checks failed'
+    : 'PASS — ' + checks.length + '/' + checks.length + ' checks';
+  log('');
+  log(failed.length ? 'FAILED: ' + failed.map((f) => f.name).join(', ') : 'All checks passed.',
+      failed.length ? 'bad' : 'ok');
+}
+
+run().catch((e) => {
+  log('PROBE THREW: ' + (e && e.stack ? e.stack : e), 'bad');
+  verdictEl.className = 'fail';
+  verdictEl.textContent = 'probe crashed';
+});
+</script>
+</body>
+</html>
