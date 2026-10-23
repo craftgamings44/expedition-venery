@@ -12,6 +12,7 @@ Run the local server — it serves the game **and** the accounts API, so local a
 production behave the same way:
 
 ```bash
+npm install                # once: installs pg for the API
 node tools/serve.js
 ```
 
@@ -19,6 +20,18 @@ Then open <http://localhost:8080/>.
 
 > **Note:** the game uses native ES modules. Opening `index.html` directly via `file://`
 > will be blocked by browser CORS rules — use a local HTTP server.
+
+## The game
+
+- **Procedurally generated caves** — deterministic per seed, every run is different but reproducible.
+- **Depth biomes** — the mountain is stratified into five strata: Shale Veins, Ember Shafts, Magma Vaults, Glacial Deep and The Abyss. Each has its own rock, ore table, hazards, light radius and monster speed. Going deeper genuinely changes what you find. The strata are measured from the elevator pad, so you always land in the first one.
+- **Six ores, from copper to diamond** — copper, iron and gold near the top; rubies in the middle; **emeralds** (green, the second most valuable) in the cold deep; and diamonds, the rarest thing in the mountain, below them. Emerald turns up at the rate diamonds used to, and diamonds are three times rarer than that — a prize, not a rumour.
+- **A monster that hunts by sound** — it cannot see through rock. It hears your pickaxe, remembers where it heard you, and learns the direction you flee. Stay silent behind stone and it won't know you exist.
+- **Three monster variants** — The Watcher, the Hound and the Burrower, each with its own senses, speed and starting adaptations.
+- **A camp and a skill tree** — build a workbench, forge, ward, bunk and lookout at the surface, and spend skill points across three branches.
+- **Ten-quest story** for Mack, then endless paid jobs.
+- **Progression** — pickaxes, mining luck, ropes, grappling hooks, decoys, and a cave-item economy.
+- **Real risk** — if it catches you, you lose your pack. Your body ends up in its lair. Go back for it.
 
 ## Accounts
 
@@ -34,6 +47,9 @@ connection string, and put it in `.env`:
 ```
 DATABASE_URL=postgresql://postgres.PROJECTREF:PASSWORD@aws-0-REGION.pooler.supabase.com:5432/postgres
 ```
+
+Use the *Session* pooler (port 5432), not the Transaction pooler — node-postgres does
+not turn off prepared statements, and the transaction pooler expects clients that do.
 
 The schema is created on first request, so there is no migration to run.
 
@@ -76,41 +92,6 @@ npx vercel deploy --prod
 
 The only npm dependency is `pg`, used by the serverless function. The game itself has no
 dependencies and no build step.
-
-
-The backend is one Vercel serverless function in `api/`, backed by Postgres. Supabase is
-the easiest way to get that database: create a project, copy the **Session pooler**
-connection string, and put it in `.env`:
-
-```
-DATABASE_URL=postgresql://postgres.PROJECTREF:PASSWORD@aws-0-REGION.pooler.supabase.com:5432/postgres
-```
-
-The schema is created on first request, so there is no migration to run.
-
-The API takes `Bearer` tokens. A session lasts 30 days; the client keeps the token in
-`localStorage`, so a reload stays signed in and a second device picks up where the first
-left off.
-
-
-## The game
-
-- **Procedurally generated caves** — deterministic per seed, every run is different but reproducible.
-- **Depth biomes** — the mountain is stratified into five strata: Shale Veins, Ember Shafts, Magma Vaults, Glacial Deep and The Abyss. Each has its own rock, ore table, hazards, light radius and monster speed. Going deeper genuinely changes what you find. The strata are measured from the elevator pad, so you always land in the first one.
-- **Six ores, from copper to diamond** — copper, iron and gold near the top; rubies in the middle; **emeralds** (green, the second most valuable) in the cold deep; and diamonds, the rarest thing in the mountain, below them. Emerald turns up at the rate diamonds used to, and diamonds are three times rarer than that — a prize, not a rumour.
-- **A monster that hunts by sound** — it cannot see through rock. It hears your pickaxe, remembers where it heard you, and learns the direction you flee. Stay silent behind stone and it won't know you exist.
-- **Three monster variants** — The Watcher, the Hound and the Burrower, each with its own senses, speed and starting adaptations.
-- **A camp and a skill tree** — build a workbench, forge, ward, bunk and lookout at the surface, and spend skill points across three branches.
-- **Ten-quest story** for Mack, then endless paid jobs.
-- **Progression** — pickaxes, mining luck, ropes, grappling hooks, decoys, and a cave-item economy.
-- **Real risk** — if it catches you, you lose your pack. Your body ends up in its lair. Go back for it.
-
-## Accounts
-
-The game works offline with a local account. If a database is configured (`DATABASE_URL`
-for the serverless API in `api/`), the same interface is used with the data on the server,
-so a campaign follows you across devices. Without one, the client falls back to local
-storage automatically — nothing to configure to play.
 
 ## Project layout
 
