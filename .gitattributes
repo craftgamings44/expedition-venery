@@ -1,0 +1,13 @@
+# Normalize line endings in the repository to LF.
+# Text files are checked out as LF on every platform, including Windows.
+* text=auto eol=lf
+
+# Binary assets must never be touched
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.woff binary
+*.woff2 binary

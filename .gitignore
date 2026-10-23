@@ -1,0 +1,27 @@
+# Node
+node_modules/
+npm-debug.log*
+yarn-error.log*
+package-lock.json.bak
+
+# Vercel
+.vercel/
+.vercel-inspect/
+
+# Generated / scratch
+*.log
+.DS_Store
+Thumbs.db
+.env
+.env.local
+.env.*.local
+
+# Local art generation scratch (committed assets under assets/ ARE tracked)
+art/tmp/
+art/test/*_scratch.png
+
+# Editor
+.vscode/*
+!.vscode/settings.json
+.idea/
+*.swp
