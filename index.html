@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Expedition Venery</title>
+<meta name="description" content="A 2D mining-horror game. Dig deep, fill your quota, and don't let the thing that hunts by sound find you.">
+<meta property="og:title" content="Expedition Venery">
+<meta property="og:description" content="A 2D mining-horror game. Dig deep, fill your quota, and don't let the thing that hunts by sound find you.">
+<meta property="og:type" content="website">
+<style>
+  :root{
+    --ink:#e9f0f6; --dim:#9bb; --accent:#8fb7d6; --panel:#0d1620;
+    --line:#44667f; --warm:#ffd9a0;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{
+    background:#070a0f; color:var(--ink);
+    font:16px Georgia,'Times New Roman',serif;
+    display:flex; align-items:center; justify-content:center;
+    padding:2rem; line-height:1.6;
+  }
+  .wrap{width:min(760px,100%)}
+  h1{
+    font-size:clamp(2.2rem,7vw,4.2rem); line-height:1; margin:0 0 .35em;
+    letter-spacing:.08em; text-align:center;
+    color:#f3f8fc; text-shadow:0 .07em 0 #2b4258, 0 0 .6em #6aa4d0;
+  }
+  .tag{text-align:center; opacity:.72; margin:0 0 2.2em; font-style:italic}
+  .panel{
+    background:var(--panel); border:2px solid var(--line); border-radius:.6em;
+    padding:1.6em 1.8em; margin-bottom:1.4em;
+  }
+  h2{margin:.1em 0 .5em; font-size:1.25em; color:var(--accent); letter-spacing:.04em}
+  p{margin:.5em 0}
+  ul{margin:.4em 0; padding-left:1.2em}
+  li{margin:.3em 0}
+  .btns{display:flex; flex-wrap:wrap; gap:.8em; margin-top:1.4em}
+  a.btn{
+    font:700 1.05em Georgia;color:#eaf3fa;background:#1c2b3a;
+    border:2px solid #5b88ad;border-radius:.4em;padding:.5em 1.4em;
+    text-decoration:none; display:inline-block; transition:background .15s;
+  }
+  a.btn:hover{background:#2c4660}
+  a.btn.primary{background:#2c4660;border-color:#8fb7d6}
+  .note{opacity:.6;font-size:.9em}
+  .status{
+    display:inline-block;padding:.2em .7em;border-radius:.3em;
+    background:#3a2a10;color:var(--warm);border:1px solid #6b5220;
+    font-size:.85em;letter-spacing:.05em;margin-bottom:.9em;
+  }
+  footer{text-align:center;opacity:.5;font-size:.85em;margin-top:2em}
+  code{background:#0a1118;padding:.1em .4em;border-radius:.25em;font-size:.9em;color:#cde}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>EXPEDITION VENERY</h1>
+  <p class="tag">Dig deep. Fill your quota. Don't let it hear you.</p>
+
+  <div class="panel">
+    <span class="status">V9 IN DEVELOPMENT</span>
+    <h2>The mountain is open</h2>
+    <p>
+      The full game is playable below — a procedurally generated cave, a monster that
+      hunts by sound and remembers where it heard you, ten quests and endless paid jobs.
+    </p>
+    <div class="btns">
+      <a class="btn primary" href="./reference/Expedition_VeneryV8.html">Play now</a>
+      <a class="btn" href="./ARCHITECTURE.md">Architecture</a>
+    </div>
+    <p class="note">
+      V9 adds depth biomes, monster variants, camp building and a skill tree.
+      See <a href="./ARCHITECTURE.md" style="color:var(--accent)">ARCHITECTURE.md</a> for the plan.
+    </p>
+  </div>
+
+  <div class="panel">
+    <h2>How it plays</h2>
+    <ul>
+      <li><b>It cannot see through rock.</b> It hunts by sound alone — your pickaxe, your footsteps, your landing.</li>
+      <li><b>It learns.</b> It remembers where it heard you and which way you fled, and it uses that next time.</li>
+      <li><b>Stay silent behind stone</b> and it won't know you exist. In the open, it will see you.</li>
+      <li><b>You cannot dig upward.</b> If it catches you, you lose your pack — and your body ends up in its lair.</li>
+    </ul>
+  </div>
+
+  <footer>MIT licensed &middot; <a href="https://github.com/craftgamings44/expedition-venery" style="color:var(--accent)">github.com/craftgamings44/expedition-venery</a></footer>
+</div>
+</body>
+</html>
