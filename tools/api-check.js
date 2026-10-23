@@ -53,6 +53,12 @@ const password = 'lantern';
 console.log('API check against ' + BASE);
 
 const health = await call('GET', '/api/health');
+if (health.status === 503) {
+  console.log('The server has no database configured (DATABASE_URL is not set).');
+  console.log('Point DATABASE_URL at the database, restart the server, and run this again.');
+  console.log('Every check below would fail for that reason alone, so stop here.');
+  process.exit(2);
+}
 check('health is 200', health.status === 200, health);
 check('health says configured', health.json && health.json.configured === true, health.json);
 
