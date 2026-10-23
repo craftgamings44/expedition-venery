@@ -7,6 +7,7 @@ package-lock.json.bak
 # Vercel
 .vercel/
 .vercel-inspect/
+.vercel
 
 # Generated / scratch
 *.log
@@ -25,3 +26,7 @@ art/test/*_scratch.png
 !.vscode/settings.json
 .idea/
 *.swp
+
+.vercel
+.env*
+!.env.example
