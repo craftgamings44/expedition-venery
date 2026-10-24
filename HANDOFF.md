@@ -27,20 +27,22 @@ affects feel, read V8. The port is only faithful where it matches it.
   (store, selectors, save), `render/`, `audio/`, `ui/`, `services/accounts.js`, plus
   `api/` (Vercel function: `index.js`, `[...path].js`, `db.js`) and `src/main.js`
   (composition root).
-- **906 headless tests pass, 0 fail** — `node tests/run.js`. The new ones cover the
+- **929 headless tests pass, 0 fail** — `node tests/run.js`. The new ones cover the
   accounts client and the API's routing and auth rules.
 - **`tools/probe.html`** boots the real game in a browser and plays an expedition through
   genuine keyboard and mouse events, reporting a pass/fail checklist. Serve with
   `node tools/serve.js` and open `http://localhost:8080/tools/probe.html`.
 - **42 AI-generated art assets** (~7 MB) under `assets/`, all with procedural fallbacks.
   Regenerate any of them with the `mmx` CLI — see `assets/PROMPTS.md`.
-- **The cloud account path works.** `node tools/serve.js` serves the game *and* the API
-  from one process, so local and production run the same handler. The database is
-  Postgres — Supabase, free tier — and `DATABASE_URL` in `.env` points at it.
-  `node tools/api-check.js <url>` exercises the whole API against any server.
+- **The cloud account path works, in production.** The database is a Supabase project
+  (`expedition-venery`, ref `qwsbtoagxkazsrcskdkd`) reached through the session pooler on
+  port 5432. `DATABASE_URL` is a Vercel production secret and lives in `.env` locally.
+  `node tools/api-check.js <url>` exercises the whole API against any server — 21 checks,
+  all passing against both localhost and the deployment.
+- **The deployment is live** at `https://expedition-venery.vercel.app`.
 
-Last commit: `3394f4a` "Add a handoff prompt so a fresh session can pick the project up
-cold", plus the cloud-path work described below.
+Last commit: `7a23cc2` "Provision the database, and harden the whole stack", pushed to
+`main`.
 
 ## The decisions that are already made
 
@@ -117,12 +119,37 @@ itself has no dependencies and no build step.
   "ore delivered" checks can fail while everything else passes. The game itself is fine —
   the probe's navigation is the weak part. Fixing it means making its dig route pick
   better goals and keeping it from walking into holes.
-- The Supabase project and the Vercel deployment still have to be created by hand (both
-  need an account). Everything on this side of them is done and tested.
+- **The probe signs up before the game boots**, so it registers a local account even when
+  the cloud is configured — `detectCloud()` has not run yet at that point. Not a game bug,
+  but the probe therefore does not exercise the cloud path.
+- **The campaign is only saved at the camp.** Shop purchases, camp building, skill
+  unlocks and signing out persist it; nothing is written while you are underground. That
+  is V9's existing cadence, now mirrored by the cloud. A player who closes the tab
+  mid-expedition loses that expedition's progress.
+- **The network cannot resolve `*.vercel.app`.** The UniFi gateway answers NXDOMAIN for
+  every `vercel.app` name while resolving `vercel.com` fine; `8.8.8.8` answers correctly.
+  Fix it on the gateway (Network → Internet → DNS) or per device (Private DNS). Until
+  then the deployment is reachable through the local proxy on port 8443.
 - The campaign's later quests and the paid-job loop have only been exercised in the
   first quest.
 - `tests/pathfind.test.js` was rewritten to be layout-independent; the cave layout is
   free to change again.
+
+## Security
+
+A full OWASP pass is done and the findings are fixed. What is in place:
+
+- Parameterised SQL everywhere; scrypt hashing at the OWASP cost with the parameters
+  stored per hash; plain usernames; 8-character minimum for new passwords only;
+  server-side session revocation on sign-out; rate limiting; a cap on save size;
+  security headers including a CSP that allows no inline scripts.
+- The dev server used to serve `.env` — which held the database password — and its path
+  check was a string prefix that let sibling directories through. Both fixed.
+- `tools/supabase-setup.js` and `tools/vercel-env.js` keep secrets off the command line:
+  the token and the connection string are read from `.env` and piped in.
+- **The Supabase access token in `.env` is disposable and should be revoked.** The
+  database password was set by the setup script and appeared in one terminal output, so
+  rotate it if that matters.
 
 ## If you want to keep momentum
 
