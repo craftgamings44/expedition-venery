@@ -48,7 +48,7 @@ async function call(method, path, body, token) {
 }
 
 const name = 'probe' + Math.floor(Date.now() / 1000);
-const password = 'lantern';
+const password = 'lantern1';
 
 console.log('API check against ' + BASE);
 

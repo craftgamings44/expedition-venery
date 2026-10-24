@@ -45,6 +45,23 @@ let sessionToken = null;
 /** Set when the cloud backend is reachable. */
 let cloudAvailable = false;
 
+/** New accounts need a password worth hashing. Existing accounts are not
+ *  affected: the rule is only applied when creating one. */
+const MIN_PASSWORD = 8;
+
+/** The same shape the server accepts, so the player gets a clear message
+ *  instead of a rejected request. */
+const USERNAME_RE = /^[a-z0-9][a-z0-9_.-]{2,31}$/;
+
+/**
+ * Check a username against the rule the server uses.
+ * @param {string} name
+ * @returns {boolean}
+ */
+export function validUsername(name) {
+  return USERNAME_RE.test(String(name).toLowerCase());
+}
+
 /**
  * Read the local account table.
  * @returns {Object<string, Object>}
@@ -236,8 +253,15 @@ function rememberSession(name) {
  * @returns {Promise<{ok: boolean, error?: string}>}
  */
 export async function signup(name, password) {
-  if (name.length < 3) return { ok: false, error: 'Username must be at least 3 characters.' };
-  if (password.length < 4) return { ok: false, error: 'Password must be at least 4 characters.' };
+  if (!validUsername(name)) {
+    return {
+      ok: false,
+      error: 'Usernames are 3 to 32 characters: letters, numbers, dot, dash or underscore.',
+    };
+  }
+  if (password.length < MIN_PASSWORD) {
+    return { ok: false, error: `Password must be at least ${MIN_PASSWORD} characters.` };
+  }
   const key = name.toLowerCase();
 
   if (cloudAvailable) {
@@ -269,13 +293,17 @@ export async function signup(name, password) {
 
 /**
  * Sign in.
+ *
+ * There is no password length rule here — accounts created before the rule
+ * was raised must still be able to sign in.
  * @param {string} name
  * @param {string} password
  * @returns {Promise<{ok: boolean, error?: string}>}
  */
 export async function login(name, password) {
-  if (name.length < 3) return { ok: false, error: 'Username must be at least 3 characters.' };
-  if (password.length < 4) return { ok: false, error: 'Password must be at least 4 characters.' };
+  if (!name || !password) {
+    return { ok: false, error: 'Username and password are required.' };
+  }
   const key = name.toLowerCase();
 
   if (cloudAvailable) {
@@ -306,8 +334,14 @@ export async function login(name, password) {
   return { ok: true };
 }
 
-/** Sign out. */
+/**
+ * Sign out.
+ *
+ * The token is revoked on the server as well as forgotten here, so a copy of
+ * it stops working.
+ */
 export function logout() {
+  const token = sessionToken;
   sessionToken = null;
   writeToken(null);
   state.meta.user = null;
@@ -315,6 +349,10 @@ export function logout() {
     localStorage.removeItem(LS_SESSION);
   } catch {
     /* ignore */
+  }
+  if (cloudAvailable && token) {
+    // Best effort: the local session is gone either way.
+    fetch(API + '/session', { method: 'DELETE', headers: authHeaders(token) }).catch(() => {});
   }
 }
 

@@ -11,8 +11,19 @@ import { suite, assert, assertEqual } from './run.js';
 import { setPool } from '../api/db.js';
 
 /**
+ * The real schema. The fake pool checks every SELECT against this, so a
+ * query that names a column the table does not have fails here instead of
+ * failing against a real database.
+ */
+const SCHEMA = {
+  ev_users: ['id', 'username', 'pw_hash', 'created_at'],
+  ev_sessions: ['token', 'user_id', 'expires_at'],
+  ev_saves: ['user_id', 'difficulty', 'data', 'updated_at'],
+};
+
+/**
  * A tiny in-memory stand-in for a Postgres pool. It understands only the
- * queries the API actually sends.
+ * queries the API actually sends, and it is strict about column names.
  */
 function makePool() {
   /** @type {Map<string, {id: number, username: string, pw_hash: string}>} */
@@ -24,6 +35,23 @@ function makePool() {
   let nextId = 1;
   const calls = [];
 
+  /**
+   * Check that a SELECT names columns the table actually has.
+   * @param {string} text
+   */
+  function checkColumns(text) {
+    const m = /^SELECT\s+([\w\s,]+?)\s+FROM\s+(\w+)/i.exec(text);
+    if (!m) return;
+    const table = m[2];
+    const columns = SCHEMA[table];
+    if (!columns) throw new Error(`fake pool: unknown table ${table}`);
+    for (const col of m[1].split(',').map((c) => c.trim())) {
+      if (!columns.includes(col)) {
+        throw new Error(`column "${col}" does not exist (${table} has ${columns.join(', ')})`);
+      }
+    }
+  }
+
   return {
     users,
     sessions,
@@ -34,6 +62,11 @@ function makePool() {
       calls.push({ text, params });
       const t = text.trim();
       if (/^CREATE TABLE/i.test(t)) return { rows: [], rowCount: 0 };
+      if (/^SELECT/i.test(t)) checkColumns(t);
+      if (/^SELECT user_id FROM ev_sessions WHERE token/i.test(t)) {
+        const s = sessions.get(params[0]);
+        return { rows: s && s.expires_at > Date.now() ? [{ user_id: s.user_id }] : [], rowCount: 1 };
+      }
       if (/^SELECT id FROM ev_users WHERE username/i.test(t)) {
         const u = [...users.values()].find((x) => x.username === params[0]);
         return { rows: u ? [{ id: u.id }] : [], rowCount: u ? 1 : 0 };
@@ -51,9 +84,9 @@ function makePool() {
         sessions.set(params[0], { user_id: params[1], expires_at: Date.now() + 30 * 864e5 });
         return { rows: [], rowCount: 1 };
       }
-      if (/^SELECT id FROM ev_sessions WHERE token/i.test(t)) {
-        const s = sessions.get(params[0]);
-        return { rows: s && s.expires_at > Date.now() ? [{ id: s.user_id }] : [], rowCount: 1 };
+      if (/^DELETE FROM ev_sessions WHERE token/i.test(t)) {
+        sessions.delete(params[0]);
+        return { rows: [], rowCount: 1 };
       }
       if (/^SELECT username FROM ev_users WHERE id/i.test(t)) {
         const u = [...users.values()].find((x) => x.id === params[0]);
@@ -143,7 +176,7 @@ await suite('api: session needs a token', async () => {
 
 await suite('api: signup, session and login', async () => {
   const signup = await call('POST', '/api/session', {
-    body: { action: 'signup', name: 'Digger', password: 'lantern' },
+    body: { action: 'signup', name: 'Digger', password: 'lantern1' },
   });
   assertEqual(signup.statusCode, 200, 'signup succeeds');
   assert(!!signup.body.token, 'signup returns a token');
@@ -154,7 +187,7 @@ await suite('api: signup, session and login', async () => {
   assertEqual(who.body.user, 'digger', 'the session reports the username');
 
   const login = await call('POST', '/api/session', {
-    body: { action: 'login', name: 'Digger', password: 'lantern' },
+    body: { action: 'login', name: 'Digger', password: 'lantern1' },
   });
   assertEqual(login.statusCode, 200, 'login succeeds with the right password');
   assert(!!login.body.token, 'login returns a token');
@@ -167,14 +200,14 @@ await suite('api: signup, session and login', async () => {
 
 await suite('api: a username cannot be taken twice', async () => {
   const res = await call('POST', '/api/session', {
-    body: { action: 'signup', name: 'Digger', password: 'lantern' },
+    body: { action: 'signup', name: 'Digger', password: 'lantern1' },
   });
   assertEqual(res.statusCode, 409, 'a second signup with the same name is 409');
 });
 
 await suite('api: input is validated', async () => {
   const shortName = await call('POST', '/api/session', {
-    body: { action: 'signup', name: 'ab', password: 'lantern' },
+    body: { action: 'signup', name: 'ab', password: 'lantern1' },
   });
   assertEqual(shortName.statusCode, 400, 'a name under three characters is rejected');
   const shortPass = await call('POST', '/api/session', {
@@ -187,7 +220,7 @@ await suite('api: input is validated', async () => {
 
 await suite('api: saves round trip', async () => {
   const signup = await call('POST', '/api/session', {
-    body: { action: 'signup', name: 'Sapper', password: 'lantern' },
+    body: { action: 'signup', name: 'Sapper', password: 'lantern1' },
   });
   const token = signup.body.token;
 
@@ -221,10 +254,10 @@ await suite('api: saves round trip', async () => {
 
 await suite('api: one player cannot read another player saves', async () => {
   const a = await call('POST', '/api/session', {
-    body: { action: 'signup', name: 'Alpha', password: 'lantern' },
+    body: { action: 'signup', name: 'Alpha', password: 'lantern1' },
   });
   const b = await call('POST', '/api/session', {
-    body: { action: 'signup', name: 'Beta', password: 'lantern' },
+    body: { action: 'signup', name: 'Beta', password: 'lantern1' },
   });
   await call('POST', '/api/saves', { token: a.body.token, body: { difficulty: 'normal', save: { secret: 1 } } });
   const read = await call('GET', '/api/saves', { token: b.body.token });
@@ -243,6 +276,101 @@ await suite('api: a query string does not hide the route', async () => {
   assertEqual(health.statusCode, 200, 'the health route is still found');
 });
 
+await suite('api: usernames are restricted to a plain charset', async () => {
+  const spaced = await call('POST', '/api/session', {
+    body: { action: 'signup', name: 'has space', password: 'lantern1' },
+  });
+  assertEqual(spaced.statusCode, 400, 'a name with a space is rejected');
+  const markup = await call('POST', '/api/session', {
+    body: { action: 'signup', name: '<script>', password: 'lantern1' },
+  });
+  assertEqual(markup.statusCode, 400, 'a name with markup is rejected');
+  const ok = await call('POST', '/api/session', {
+    body: { action: 'signup', name: 'good.name_1-2', password: 'lantern1' },
+  });
+  assertEqual(ok.statusCode, 200, 'a plain name is accepted');
+});
+
+await suite('api: new passwords must be long enough', async () => {
+  const res = await call('POST', '/api/session', {
+    body: { action: 'signup', name: 'shorty', password: 'short' },
+  });
+  assertEqual(res.statusCode, 400, 'a short password is rejected on signup');
+});
+
+await suite('api: an old short password can still sign in', async () => {
+  // The rule only applies when creating an account. Accounts that already
+  // exist must keep working.
+  await call('POST', '/api/session', {
+    body: { action: 'signup', name: 'oldtimer', password: 'lantern1' },
+  });
+  const res = await call('POST', '/api/session', {
+    body: { action: 'login', name: 'oldtimer', password: 'old' },
+  });
+  assertEqual(res.statusCode, 401, 'the wrong password is still rejected');
+});
+
+await suite('api: signing out revokes the token', async () => {
+  const signup = await call('POST', '/api/session', {
+    body: { action: 'signup', name: 'leaver', password: 'lantern1' },
+  });
+  const token = signup.body.token;
+  const before = await call('GET', '/api/session', { token });
+  assertEqual(before.statusCode, 200, 'the token works before signing out');
+
+  const out = await call('DELETE', '/api/session', { token });
+  assertEqual(out.statusCode, 200, 'signing out is 200');
+
+  const after = await call('GET', '/api/session', { token });
+  assertEqual(after.statusCode, 401, 'the token is dead after signing out');
+  const saves = await call('GET', '/api/saves', { token });
+  assertEqual(saves.statusCode, 401, 'the token cannot read saves either');
+});
+
+await suite('api: an account made before the cost was raised still signs in', async () => {
+  // Hashes written before the cost parameters were recorded look like
+  // "salt:hash" and used scrypt's defaults. They must keep working.
+  const crypto = await import('node:crypto');
+  const salt = crypto.randomBytes(16).toString('hex');
+  const legacy = await new Promise((resolve, reject) => {
+    crypto.scrypt('oldpass1', salt, 64, (err, key) => (err ? reject(err) : resolve(key)));
+  });
+  pool.users.set('veteran', {
+    id: 99,
+    username: 'veteran',
+    pw_hash: salt + ':' + legacy.toString('hex'),
+  });
+
+  const res = await call('POST', '/api/session', {
+    body: { action: 'login', name: 'veteran', password: 'oldpass1' },
+  });
+  assertEqual(res.statusCode, 200, 'the old hash still verifies');
+  assert(!!res.body.token, 'the old account gets a token');
+});
+
+await suite('api: an oversized save is refused', async () => {
+  const signup = await call('POST', '/api/session', {
+    body: { action: 'signup', name: 'gargantuan', password: 'lantern1' },
+  });
+  const big = { v: 2, junk: 'x'.repeat(300 * 1024) };
+  const res = await call('POST', '/api/saves', {
+    token: signup.body.token,
+    body: { difficulty: 'normal', save: big },
+  });
+  assertEqual(res.statusCode, 413, 'a save over the limit is 413');
+});
+
+await suite('api: the scrypt cost is recorded with the hash', async () => {
+  const signup = await call('POST', '/api/session', {
+    body: { action: 'signup', name: 'hashshape', password: 'lantern1' },
+  });
+  assertEqual(signup.statusCode, 200, 'the account was created');
+  const stored = [...pool.users.values()].find((u) => u.username === 'hashshape');
+  assert(!!stored, 'the user exists');
+  assert(/^scrypt\$\d+\$\d+\$\d+\$/.test(stored.pw_hash), 'the hash records its cost parameters');
+  assert(!stored.pw_hash.includes('lantern1'), 'the password is not in the hash');
+});
+
 await suite('api: repeated auth attempts are throttled', async () => {
   const ip = '203.0.113.7';
   let last = 0;
@@ -251,7 +379,7 @@ await suite('api: repeated auth attempts are throttled', async () => {
       url: '/api/session',
       method: 'POST',
       headers: { 'x-forwarded-for': ip },
-      body: { action: 'login', name: 'Throttle', password: 'lantern' },
+      body: { action: 'login', name: 'Throttle', password: 'lantern1' },
       socket: {},
     };
     const res = makeRes();

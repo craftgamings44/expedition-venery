@@ -7,6 +7,7 @@
  *   GET    /api/health    -> is the backend configured and reachable
  *   GET    /api/session   -> who am I
  *   POST   /api/session   -> signup | login
+ *   DELETE /api/session   -> sign out and revoke the token
  *   GET    /api/saves     -> all saves for the signed-in user
  *   POST   /api/saves     -> write one save
  *   DELETE /api/saves     -> erase all saves
@@ -17,7 +18,14 @@
  * falls back to local accounts — the game never breaks because the backend is
  * missing.
  *
- * Passwords are hashed server-side with scrypt. The client never sees a hash.
+ * Security notes:
+ *   - every query is parameterized; nothing from the request is concatenated
+ *     into SQL.
+ *   - passwords are hashed with scrypt using the OWASP-recommended cost and
+ *     the parameters are stored with the hash, so they can be raised later
+ *     without invalidating existing accounts.
+ *   - session tokens are random, and signing out revokes them server-side.
+ *   - auth attempts are rate limited per client address.
  */
 
 import crypto from 'node:crypto';
@@ -29,29 +37,56 @@ let schemaPromise = null;
 /** @type {Map<string, {n: number, until: number}>} */
 const attempts = new Map();
 
-/** Auth attempts allowed per IP per window. */
+/** Auth attempts allowed per client per window. */
 const AUTH_LIMIT = 20;
 const AUTH_WINDOW_MS = 10 * 60 * 1000;
 
+/** scrypt cost. 2^16 is the OWASP minimum; the parameters are stored with
+ *  each hash so they can be raised without breaking old accounts. */
+const SCRYPT = { N: 65536, r: 8, p: 1 };
+/** Cost used for hashes written before the parameters were recorded. */
+const SCRYPT_LEGACY = { N: 16384, r: 8, p: 1 };
+
+/** A save is a campaign. Anything larger than this is not one. */
+const MAX_SAVE_BYTES = 256 * 1024;
+
+/** Usernames are shown in the UI and used as a storage key. Keep them plain. */
+const USERNAME_RE = /^[a-z0-9][a-z0-9_.-]{2,31}$/;
+
+/** New passwords must be long enough to be worth hashing. */
+const MIN_PASSWORD = 8;
+
 /**
- * Read the caller's IP for rate limiting.
+ * Read the caller's address for rate limiting.
+ *
+ * Vercel appends the real client address to x-forwarded-for, so the last
+ * entry is the one the platform observed and the first is whatever the
+ * caller sent. Use the last.
  * @param {import('@vercel/node').VercelRequest} req
  * @returns {string}
  */
 function clientIp(req) {
   const h = req.headers['x-forwarded-for'];
-  const v = Array.isArray(h) ? h[0] : h;
-  return String(v || req.socket?.remoteAddress || 'unknown').split(',')[0].trim();
+  const v = Array.isArray(h) ? h.join(',') : h;
+  if (v) {
+    const parts = String(v).split(',').map((s) => s.trim()).filter(Boolean);
+    if (parts.length) return parts[parts.length - 1];
+  }
+  return String(req.socket?.remoteAddress || 'unknown');
 }
 
 /**
- * Count an auth attempt for this IP. Returns false when the caller is over
- * the limit.
+ * Count an auth attempt for this address. Returns false when the caller is
+ * over the limit.
  * @param {import('@vercel/node').VercelRequest} req
  * @returns {boolean}
  */
 function allowAuth(req) {
   const now = Date.now();
+  // Drop expired entries so the map cannot grow without bound.
+  if (attempts.size > 1000) {
+    for (const [k, v] of attempts) if (v.until < now) attempts.delete(k);
+  }
   const ip = clientIp(req);
   const rec = attempts.get(ip);
   if (!rec || rec.until < now) {
@@ -64,28 +99,51 @@ function allowAuth(req) {
 
 /**
  * Hash a password with scrypt and a random salt.
+ *
+ * The cost parameters are stored alongside the hash so they can be raised
+ * later without invalidating accounts that already exist.
  * @param {string} password
- * @returns {Promise<string>} `salt:hash` in hex
+ * @returns {Promise<string>} `scrypt$N$r$p$salt:hash` in hex
  */
 async function hashPassword(password) {
   const salt = crypto.randomBytes(16).toString('hex');
   const derived = await new Promise((resolve, reject) => {
-    crypto.scrypt(password, salt, 64, (err, key) => (err ? reject(err) : resolve(key)));
+    crypto.scrypt(password, salt, 64, { ...SCRYPT, maxmem: 128 * 1024 * 1024 }, (err, key) =>
+      err ? reject(err) : resolve(key),
+    );
   });
-  return salt + ':' + derived.toString('hex');
+  return `scrypt$${SCRYPT.N}$${SCRYPT.r}$${SCRYPT.p}$${salt}:${derived.toString('hex')}`;
 }
 
 /**
- * Verify a password against a stored `salt:hash`.
+ * Verify a password against a stored hash.
+ *
+ * Reads the cost parameters out of the stored value, so old hashes keep
+ * working and newer ones can use a higher cost.
  * @param {string} password
  * @param {string} stored
  * @returns {Promise<boolean>}
  */
 async function verifyPassword(password, stored) {
-  const [salt, hash] = String(stored).split(':');
+  const raw = String(stored || '');
+  let cost = SCRYPT_LEGACY;
+  let body = raw;
+  if (raw.startsWith('scrypt$')) {
+    const parts = raw.split('$');
+    const saltHash = parts[parts.length - 1];
+    const N = Number(parts[1]);
+    const r = Number(parts[2]);
+    const p = Number(parts[3]);
+    if (!Number.isInteger(N) || !Number.isInteger(r) || !Number.isInteger(p) || N < 2) return false;
+    cost = { N, r, p };
+    body = saltHash;
+  }
+  const [salt, hash] = body.split(':');
   if (!salt || !hash) return false;
   const derived = await new Promise((resolve, reject) => {
-    crypto.scrypt(password, salt, 64, (err, key) => (err ? reject(err) : resolve(key)));
+    crypto.scrypt(password, salt, 64, { ...cost, maxmem: 256 * 1024 * 1024 }, (err, key) =>
+      err ? reject(err) : resolve(key),
+    );
   });
   const a = Buffer.from(hash, 'hex');
   const b = derived;
@@ -149,24 +207,16 @@ function parseBody(raw) {
 
 /**
  * Look up the user id for a bearer token.
+ *
+ * ev_sessions has no id column — the user it belongs to is user_id.
  * @param {any} pool
  * @param {string|null} token
  * @returns {Promise<number|null>}
  */
 async function userForToken(pool, token) {
   if (!token) return null;
-  const res = await pool.query('SELECT id FROM ev_sessions WHERE token = $1 AND expires_at > NOW()', [token]);
-  return res.rows[0]?.id ?? null;
-}
-
-/**
- * The last segment of the request path: /api/session -> session.
- * @param {string} url
- * @returns {string}
- */
-function route(url) {
-  const parts = String(url || '').split('?')[0].split('/').filter(Boolean);
-  return parts.length ? parts[parts.length - 1] : '';
+  const res = await pool.query('SELECT user_id FROM ev_sessions WHERE token = $1 AND expires_at > NOW()', [token]);
+  return res.rows[0]?.user_id ?? null;
 }
 
 /**
@@ -176,6 +226,7 @@ function route(url) {
  */
 export default async function handler(req, res) {
   res.setHeader('Content-Type', 'application/json');
+  res.setHeader('Cache-Control', 'no-store');
   const path = route(req.url);
 
   if (path === 'health') {
@@ -221,6 +272,14 @@ export default async function handler(req, res) {
         return;
       }
 
+      if (req.method === 'DELETE') {
+        // Signing out has to revoke the token, not just forget it.
+        const token = bearer(req);
+        if (token) await pool.query('DELETE FROM ev_sessions WHERE token = $1', [token]);
+        res.status(200).json({ ok: true });
+        return;
+      }
+
       if (req.method === 'POST') {
         if (!allowAuth(req)) {
           res.status(429).json({ error: 'Too many attempts. Wait a few minutes and try again.' });
@@ -228,41 +287,47 @@ export default async function handler(req, res) {
         }
         const body = parseBody(req.body);
         const action = body.action;
-        const name = String(body.name || '').trim();
+        const name = String(body.name || '').trim().toLowerCase();
         const password = String(body.password || '');
-        if (name.length < 3) {
-          res.status(400).json({ error: 'Username must be at least 3 characters.' });
-          return;
-        }
-        if (password.length < 4) {
-          res.status(400).json({ error: 'Password must be at least 4 characters.' });
-          return;
-        }
-        const key = name.toLowerCase();
 
         if (action === 'signup') {
-          const existing = await pool.query('SELECT id FROM ev_users WHERE username = $1', [key]);
+          if (!USERNAME_RE.test(name)) {
+            res.status(400).json({
+              error: 'Usernames are 3 to 32 characters: letters, numbers, dot, dash or underscore.',
+            });
+            return;
+          }
+          if (password.length < MIN_PASSWORD) {
+            res.status(400).json({ error: `Password must be at least ${MIN_PASSWORD} characters.` });
+            return;
+          }
+          const existing = await pool.query('SELECT id FROM ev_users WHERE username = $1', [name]);
           if (existing.rows.length) {
             res.status(409).json({ error: 'That username is already taken.' });
             return;
           }
           const h = await hashPassword(password);
-          const ins = await pool.query('INSERT INTO ev_users (username, pw_hash) VALUES ($1, $2) RETURNING id', [key, h]);
+          const ins = await pool.query('INSERT INTO ev_users (username, pw_hash) VALUES ($1, $2) RETURNING id', [name, h]);
           const token = crypto.randomBytes(32).toString('hex');
           await pool.query('INSERT INTO ev_sessions (token, user_id, expires_at) VALUES ($1, $2, NOW() + INTERVAL \'30 days\')', [token, ins.rows[0].id]);
-          res.status(200).json({ token, user: key });
+          res.status(200).json({ token, user: name });
           return;
         }
 
         if (action === 'login') {
-          const u = await pool.query('SELECT id, pw_hash FROM ev_users WHERE username = $1', [key]);
+          // No length rule here: existing accounts keep working.
+          if (!name || !password) {
+            res.status(400).json({ error: 'Username and password are required.' });
+            return;
+          }
+          const u = await pool.query('SELECT id, pw_hash FROM ev_users WHERE username = $1', [name]);
           if (!u.rows.length || !(await verifyPassword(password, u.rows[0].pw_hash))) {
             res.status(401).json({ error: 'Wrong username or password.' });
             return;
           }
           const token = crypto.randomBytes(32).toString('hex');
           await pool.query('INSERT INTO ev_sessions (token, user_id, expires_at) VALUES ($1, $2, NOW() + INTERVAL \'30 days\')', [token, u.rows[0].id]);
-          res.status(200).json({ token, user: key });
+          res.status(200).json({ token, user: name });
           return;
         }
 
@@ -287,11 +352,17 @@ export default async function handler(req, res) {
       if (req.method === 'POST') {
         const body = parseBody(req.body);
         const difficulty = String(body.difficulty || 'normal');
+        const save = body.save ?? {};
+        const size = Buffer.byteLength(JSON.stringify(save) || '', 'utf8');
+        if (size > MAX_SAVE_BYTES) {
+          res.status(413).json({ error: 'That save is too large.' });
+          return;
+        }
         await pool.query(
           `INSERT INTO ev_saves (user_id, difficulty, data, updated_at)
            VALUES ($1, $2, $3, NOW())
            ON CONFLICT (user_id, difficulty) DO UPDATE SET data = $3, updated_at = NOW()`,
-          [uid, difficulty, body.save ?? {}]
+          [uid, difficulty, save]
         );
         res.status(200).json({ ok: true });
         return;
@@ -308,4 +379,14 @@ export default async function handler(req, res) {
     console.error('api error', err);
     res.status(500).json({ error: 'Server error.' });
   }
+}
+
+/**
+ * The last segment of the request path: /api/session -> session.
+ * @param {string} url
+ * @returns {string}
+ */
+function route(url) {
+  const parts = String(url || '').split('?')[0].split('/').filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : '';
 }

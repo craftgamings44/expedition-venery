@@ -83,7 +83,7 @@ await suite('accounts: signup uses the cloud when it is configured', async () =>
   calls = [];
   respond = () => reply(200, { token: 'tok-123', user: 'digger' });
 
-  const res = await accounts.signup('Digger', 'lantern');
+  const res = await accounts.signup('Digger', 'lantern1');
   assert(res.ok, 'the signup succeeds');
   assertEqual(calls.length, 1, 'exactly one request was made');
   assertEqual(calls[0].url, '/api/session', 'the API is asked for with an absolute path');
@@ -100,7 +100,7 @@ await suite('accounts: the API is never asked for with a relative path', async (
   await accounts.detectCloud();
   calls = [];
   respond = () => reply(200, { token: 'tok-123', user: 'digger' });
-  await accounts.signup('Digger', 'lantern');
+  await accounts.signup('Digger', 'lantern1');
   await accounts.listSaves();
   await accounts.writeSave({ v: 2 });
   for (const c of calls) {
@@ -140,7 +140,7 @@ await suite('accounts: logging out clears the token', async () => {
   await accounts.detectCloud();
   calls = [];
   respond = () => reply(200, { token: 'tok-123', user: 'digger' });
-  await accounts.signup('Digger', 'lantern');
+  await accounts.signup('Digger', 'lantern1');
   assert(store.get('ev_cloud_token'), 'the token is there before the logout');
 
   accounts.logout();
@@ -149,13 +149,44 @@ await suite('accounts: logging out clears the token', async () => {
   assert(!accounts.usingCloud(), 'the client is not using the cloud');
 });
 
+await suite('accounts: logging out revokes the token on the server', async () => {
+  reset();
+  respond = () => reply(401, { error: 'Not signed in.' });
+  await accounts.detectCloud();
+  calls = [];
+  respond = () => reply(200, { token: 'tok-123', user: 'digger' });
+  await accounts.signup('Digger', 'lantern1');
+
+  calls = [];
+  respond = () => reply(200, { ok: true });
+  accounts.logout();
+  assertEqual(calls.length, 1, 'the server was told');
+  assertEqual(calls[0].url, '/api/session', 'the session route is used');
+  assertEqual(calls[0].method, 'DELETE', 'the request revokes the token');
+  assertEqual(calls[0].headers.Authorization, 'Bearer tok-123', 'the token being revoked is sent');
+});
+
+await suite('accounts: a weak username is refused before the server sees it', async () => {
+  reset();
+  respond = () => reply(401, { error: 'Not signed in.' });
+  await accounts.detectCloud();
+  calls = [];
+  respond = () => reply(200, { token: 'tok-123', user: 'x' });
+
+  const bad = await accounts.signup('has space', 'lantern1');
+  assert(!bad.ok, 'a username with a space is refused');
+  const short = await accounts.signup('digger', 'short');
+  assert(!short.ok, 'a short password is refused');
+  assertEqual(calls.length, 0, 'nothing was sent to the server');
+});
+
 await suite('accounts: without a backend, accounts stay on this device', async () => {
   reset();
   respond = () => reply(503, { error: 'not configured' });
   await accounts.detectCloud();
   calls = [];
 
-  const res = await accounts.signup('Digger', 'lantern');
+  const res = await accounts.signup('Digger', 'lantern1');
   assert(res.ok, 'the local signup succeeds');
   assertEqual(calls.length, 0, 'nothing was sent to the server');
   const accounts2 = JSON.parse(store.get('ev_accounts') || '{}');
@@ -169,7 +200,7 @@ await suite('accounts: saves go to the cloud when signed in', async () => {
   await accounts.detectCloud();
   calls = [];
   respond = () => reply(200, { token: 'tok-123', user: 'digger' });
-  await accounts.signup('Digger', 'lantern');
+  await accounts.signup('Digger', 'lantern1');
 
   calls = [];
   respond = () => reply(200, { saves: { normal: { v: 2, q: 4 } } });
@@ -193,7 +224,7 @@ await suite('accounts: a failed cloud save does not lose the campaign', async ()
   await accounts.detectCloud();
   calls = [];
   respond = () => reply(200, { token: 'tok-123', user: 'digger' });
-  await accounts.signup('Digger', 'lantern');
+  await accounts.signup('Digger', 'lantern1');
 
   // The server is unreachable from here on.
   respond = () => {

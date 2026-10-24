@@ -41,8 +41,21 @@ Without one the client falls back to local storage automatically — nothing to 
 to play.
 
 The backend is one Vercel serverless function in `api/`, backed by Postgres. Supabase is
-the easiest way to get that database: create a project, copy the **Session pooler**
-connection string, and put it in `.env`:
+the easiest way to get that database, and the setup script does the work for you:
+
+```bash
+# 1. Supabase dashboard -> Account Preferences -> Access Tokens -> Generate new token
+# 2. put it in .env as SUPABASE_ACCESS_TOKEN=sbp_...
+node tools/supabase-setup.js
+```
+
+It finds your organisation, creates the project (or reuses one that already
+exists), waits for the database to come up, reads the pooler configuration and
+writes `DATABASE_URL` into `.env`. The password never appears on the terminal.
+
+If you would rather paste the connection string yourself, copy the **Session
+pooler** URI from Project Settings → Database → Connection string and put it in
+`.env`:
 
 ```
 DATABASE_URL=postgresql://postgres.PROJECTREF:PASSWORD@aws-0-REGION.pooler.supabase.com:5432/postgres
@@ -93,6 +106,36 @@ npx vercel deploy --prod
 The only npm dependency is `pg`, used by the serverless function. The game itself has no
 dependencies and no build step.
 
+## Security
+
+The game is public and its accounts are real, so the backend takes the usual
+precautions. What is in place:
+
+- **Parameterised SQL everywhere.** Nothing from a request is concatenated into
+  a query.
+- **scrypt password hashing** at the OWASP-recommended cost, with the cost
+  parameters stored alongside each hash so they can be raised later without
+  invalidating accounts that already exist.
+- **Long passwords for new accounts** (at least 8 characters). The rule only
+  applies at sign-up, so accounts created earlier still sign in.
+- **Plain usernames** — letters, numbers, dot, dash and underscore. The one
+  place a username is shown escapes it anyway.
+- **Revocable sessions.** Signing out deletes the token on the server, so a
+  copied token stops working.
+- **Rate limiting** on sign-up and sign-in, per client address.
+- **A size limit on saved campaigns**, so one enormous request cannot bloat
+  the database.
+- **Security headers** on every response: a content security policy that
+  allows no inline scripts, `X-Content-Type-Options`, `X-Frame-Options`,
+  `Referrer-Policy`, `Permissions-Policy` and HSTS.
+- **Secrets stay out of the served files.** `.env`, `.git`, `.vercel` and
+  `node_modules` are refused by the dev server, and Vercel never uploads them
+  because they are gitignored.
+
+`node tools/api-check.js <url>` exercises all of it against a running server —
+sign-up, sign-in, rejected passwords, duplicate names, token revocation, save
+round-trips and cross-player isolation.
+
 ## Project layout
 
 ```
@@ -116,6 +159,11 @@ api/                    Vercel serverless function (accounts + saves)
 assets/                 AI-generated icons, UI art, creature portraits, biome art
 tests/                  headless Node test harness (no framework)
 tools/                  dev utilities (dev server, API adapter, API check, browser probe)
+  serve.js              dev server — game and API, refuses dotfiles
+  api-local.js          adapts Node requests to the Vercel handler
+  api-check.js          exercises the API against any server
+  supabase-setup.js     provisions the database and writes DATABASE_URL
+  vercel-env.js         pushes DATABASE_URL to Vercel without printing it
 reference/              the original single-file prototype
 ARCHITECTURE.md         the V9 architecture proposal and delivery plan
 ```
